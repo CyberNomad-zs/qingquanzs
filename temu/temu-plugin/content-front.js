@@ -4,6 +4,29 @@
   var LOG = TemuLogger.createLogger('front');
   LOG.info('content-front.js loaded -- v1');
 
+  // 全局未捕获异常上报：走 LOG.error → sendToBg → SW 的 msg.type==='log' ERROR 分支 → 飞书。
+  // 前台每个 tab 是独立 document，注入一次、tab 关闭销毁，监听不会重复挂。
+  function _fmtErr(e) {
+    try {
+      if (e && e.message) return (e.name || 'Error') + ': ' + e.message;
+      return String(e);
+    } catch (_) { return 'unserializable error'; }
+  }
+  window.addEventListener('error', (ev) => {
+    try {
+      const m = (ev && ev.error) ? _fmtErr(ev.error)
+        : ((ev && ev.message) ? ev.message : 'unknown');
+      const loc = ev && ev.filename ? (' @ ' + ev.filename + ':' + (ev.lineno || 0)) : '';
+      LOG.error('front uncaught: ' + m + loc);
+    } catch (_) {}
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    try {
+      const r = ev && ev.reason;
+      LOG.error('front unhandledrejection: ' + _fmtErr(r));
+    } catch (_) {}
+  });
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---------- 工具 ----------
@@ -223,10 +246,50 @@
     return groups;
   }
 
+  // ---------- 人机验证 / 页面异常检测 ----------
+  // v22.2：前台弹人机验证时，商品 DOM 不会渲染 → extractProductData 会一直空转。
+  // 这里在解析前先扫一遍 captcha / 风控 / 错误页标志，命中则上报飞书，避免：
+  //  ① extractWithRetry 25s 内空转白等；
+  //  ② 一个被风控的店每 3h 轮巡都静默漏掉，运营不知道要过验证。
+  function detectCaptcha() {
+    try {
+      const html = document.documentElement ? document.documentElement.outerHTML : '';
+      if (!html) return null;
+      // 页面整体极短（错误页 / 空白页）也归为异常，但需有佐证文本，避免误杀 loading
+      // 关键词覆盖：Temu 常见英文风控 + 中文 + 通用 captcha 框
+      const kw = [
+        'verify you are human', 'verify that you are', 'are you human',
+        'human verification', 'robot verification', 'unusual traffic',
+        '请验证', '人机验证', '滑块验证', '安全验证', '验证一下', '拖动滑块',
+        'captcha', 'recaptcha', 'geetest', 'nc_iconfont', 'tcaptcha',
+        'access denied', '请求被拦截', '访问被拒', '页面不存在', 'not found',
+        '无法访问', '网络错误', '连接超时', 'ERR_CONNECTION', 'ERR_NAME',
+      ];
+      const low = html.toLowerCase();
+      const hit = kw.find((k) => low.indexOf(k.toLowerCase()) >= 0);
+      if (!hit) return null;
+      // 进一步确认：要么有 iframe/canvas（验证码容器），要么正文确实很短（非正常商品页）
+      const hasBox = /iframe|canvas/i.test(html)
+        || !!document.querySelector('iframe[src*="captcha" i],iframe[src*="recaptcha" i],canvas,[class*="captcha" i],[class*="verify" i],[id*="captcha" i]');
+      const bodyText = (document.body ? document.body.innerText : '') || '';
+      const shortPage = bodyText.replace(/\s+/g, ' ').trim().length < 400;
+      if (!hasBox && !shortPage) return null; // 关键词命中但页面内容丰富 → 可能只是商品文案里提到，不当风控
+      return { keyword: hit, hasBox, shortPage, snippet: bodyText.slice(0, 200) };
+    } catch (e) { return null; }
+  }
+
   // ---------- 提取并上报 ----------
   function extractProductData() {
     // 只对产品详情页生效（URL 含 goods_id 或 -m- 模式）
     const url = window.location.href;
+    // v22.2：先扫人机验证/错误页。命中就返回带 captcha 标志的 data（url 用于 store 归属），
+    // 不再继续解析变体（验证页本就没有商品 DOM）。hasValidData 不认 captcha，所以
+    // extractWithRetry 不会把 captcha 当成功；sendToBackground 仍会把它发出去。
+    const cap = detectCaptcha();
+    if (cap) {
+      LOG.warn('Captcha/blocked detected: keyword="' + cap.keyword + '" url=' + url.slice(0, 80));
+      return { url: url.split('?')[0], fullUrl: url, captcha: true, captchaInfo: cap };
+    }
     if (!/goods_id=|\/-\w{2,}-m-|product/i.test(url)) {
       LOG.info('Skipped: not a product page, url=' + url.slice(0, 80));
       return null;
@@ -265,24 +328,40 @@
 
   // ---------- 初始化 ----------
   // 页面加载完成后延迟一下再扫（React 渲染需要时间）
-  async function init() {
-    await sleep(2500); // 等 SPA 渲染
-    let data = extractProductData();
-    // 如果第一次没扫到 variant（可能页面还在加载），再等几秒重试
-    if (data && data.variants.length === 0) {
-      await sleep(3000);
+  // v22.2：SPA 慢渲染时 title/variants 可能首轮都空——原来只对「variants=0」重试一次，
+  // 对「title 和 variants 都空」直接放弃（被 extractProductData 的 skip 吞掉），
+  // 导致前台轮巡新开 tab 命中率低。改为带退避的多次重试，直到拿到有效数据或耗尽预算。
+  function hasValidData(d) {
+    return !!(d && d.url && (d.title || (d.variants && d.variants.length)));
+  }
+  async function extractWithRetry(totalBudgetMs) {
+    const stepMs = 2500;
+    const t0 = Date.now();
+    let data = null;
+    while (Date.now() - t0 < totalBudgetMs) {
       data = extractProductData();
+      if (hasValidData(data)) return data;
+      // v22.2：检测到人机验证/错误页 → 立即返回（不再空转 25s）。
+      // sendToBackground 会走 captcha 上报分支飞书提醒运营。
+      if (data && data.captcha) return data;
+      await sleep(stepMs); // 退避再扫，等 SPA 继续渲染
     }
+    return data; // 耗尽预算也要返回最后一次结果（可能为 null）
+  }
+  async function init() {
+    await sleep(2500); // 等 SPA 首屏渲染
+    const data = await extractWithRetry(20000); // 最多再试 ~20s
     sendToBackground(data);
   }
 
-  // 监听来自 background 的手动检查请求
+  // 监听来自 background 的手动检查请求（frontCycle 复用 tab 路径会触发）
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg && msg.cmd === 'frontCheck') {
       (async () => {
-        const data = extractProductData();
+        const budget = (typeof msg.budgetMs === 'number' && msg.budgetMs > 0) ? msg.budgetMs : 15000;
+        const data = await extractWithRetry(budget);
         sendToBackground(data);
-        sendResponse({ ok: true, data });
+        sendResponse({ ok: true, hasData: hasValidData(data), data });
       })();
       return true;
     }

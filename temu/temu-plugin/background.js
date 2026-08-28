@@ -49,6 +49,11 @@ var log = TemuLogger.createLogger('bg');
 //   ② A 路径：onSaleHighWater；子集形态（≈chip 且远低于高水位）拒绝写入
 //   ③ 从子集水位恢复到接近高水位 → 静默抬基准，不发上升卡
 //   ④ silent 轮巡路径禁止把基准往下压
+// v22.1：chip 含已下架商品，on-sale pool < chip 是常态；trusted 全量才决定是否补扫
+// v22.2：报错转发飞书（签名去重 30min）+ 前台轮巡等真实上报（不再盲等 12s）
+//        + 前台风控/网页打不开红卡（独立 30min 去重）
+// v22.3：库存归零（pageQuery SKU stock>0→0 橙色卡）
+//        + B 路径子集→全量静默重建清单，不发上架点名（修 HomeCove 假上架）
 const ONSALE_MONITOR_IN_PLUGIN = true;
 const ONSALE_QTY_ALERT = true;       // A：数量变化（确认后）卡
 const ONSALE_SCAN_ALERT = true;      // B：清单 diff 点名
@@ -72,6 +77,9 @@ const ONSALE_SCAN_VS_COUNT_RATIO = 0.5;   // tabCount/items < count * 50%
 const ONSALE_SCAN_VS_COUNT_MIN_DROP = 3;  // 且至少少 3 个
 const ONSALE_SCAN_VS_COUNT_MAX_AGE_MS = 10 * 60 * 1000; // 可信 count 时效
 
+// 库存归零检测：pageQuery 中 SKU 的 realStock/virtualStock 从 >0 变为 0 时飞书提醒
+const STOCK_ZERO_ALERT = true;
+
 // 兼容旧名：曾用 DELIST_IN_PLUGIN 只控下架扫描
 const DELIST_IN_PLUGIN = ONSALE_MONITOR_IN_PLUGIN && ONSALE_SCAN_ALERT;
 
@@ -81,6 +89,8 @@ const DEFAULT_CONFIG = {
   intervalMinutes: 15,
   enabled: true,
   storeName: '',
+  // 机器名标签（报错转发用）：卡片标题带上，方便区分是哪台电脑。留空显示「未命名机器」。
+  machineLabel: '',
   // 定时必提醒：每天固定时刻强制发飞书状态汇报（无异常也发，证明插件活着）
   mustRemindEnabled: true,
   mustRemindTimes: ['09:30', '16:30'],
@@ -354,6 +364,158 @@ async function sendFeishu(webhook, title, lines, template) {
     log.error('Feishu send FAILED: ' + (e && e.message ? e.message : 'unknown'));
     return { ok: false, msg: '发送失败：' + (e && e.message) };
   }
+}
+
+// ---------------- 报错转发飞书 ----------------
+// 插件运行时报错（SW 各 catch / content 全局监听 / SW 未捕获）经现有 webhook 推到用户飞书。
+// 复用告警 webhook，不触发 FeishuApp.syncAfterAlert（不写多维表/任务）。
+const ERROR_REPORT_COOLDOWN_MS = 30 * 60 * 1000;       // 同一签名 30 分钟内只发一次
+const ERROR_REPORT_KEEP_MS = 2 * 60 * 60 * 1000;        // 冷却历史保留窗口（排障用）
+const ERROR_REPORT_KEY = 'errorReportCooldown';         // { signature: ts } 存 storage，跨 SW 回收存活
+let _reportDepth = 0;                                   // 递归守卫（计数器，防 await 嵌套）
+let reportErrorChain = Promise.resolve();               // 串行化：防并发同签名双发 + storage lost-update
+
+// 错误签名归一化：同一根因 → 同一签名，跨数字/ID/时间戳/URL/栈帧稳定。
+// 保留店铺名（避免不同店的同类错误被过度合并），不把机器名算进签名（固定维度，放 title）。
+function normalizeErrorSignature(raw) {
+  let s = String(raw || '');
+  const nl = s.indexOf('\n');
+  if (nl >= 0) s = s.slice(0, nl);                       // 只取首行，丢栈
+  s = s
+    .replace(/\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\]?/g, '') // 时间戳
+    .replace(/0x[0-9a-f]+/gi, '#hex')
+    .replace(/\b[a-f0-9]{12,}\b/gi, '#id')               // 长 hex（productId / requestId）
+    .replace(/https?:\/\/\S+/g, '#url')
+    .replace(/\b\d+\b/g, '#')                            // 数字（放最后，避免吃掉上面占位符里的数）
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .slice(0, 160);
+  return s;
+}
+
+async function getErrorCooldown() {
+  const { [ERROR_REPORT_KEY]: m } = await chrome.storage.local.get(ERROR_REPORT_KEY);
+  return m && typeof m === 'object' ? m : {};
+}
+function pruneErrorCooldown(m, now) {
+  const out = {};
+  for (const k of Object.keys(m || {})) {
+    const ts = m[k];
+    if (typeof ts === 'number' && now - ts < ERROR_REPORT_KEEP_MS) out[k] = ts;
+  }
+  return out;
+}
+
+// opts: { source }  source 用于卡片标注来源（content/front/cycle/frontCycle/mustRemind/msg/global）
+async function reportErrorToFeishu(rawMsg, opts) {
+  if (_reportDepth > 0) return;                          // 递归守卫：已在上报中，跳过
+  const sig = normalizeErrorSignature(rawMsg);
+  if (!sig) return;
+  // 前缀黑名单：上报自身 / 飞书失败不回环（content 不会产生这些前缀，纯防将来）
+  if (/^(feishu send failed|feishuapp|error report|sw uncaught|sw unhandledrejection)/i.test(sig)) return;
+  if (/resizeobserver/i.test(sig)) return;
+
+  // 串行化：把读冷却→判→发→写冷却整段放进链，杜绝并发双发与 storage 覆盖
+  reportErrorChain = reportErrorChain.then(async () => {
+    _reportDepth++;
+    try {
+      const cfg = await getConfig();
+      if (!cfg.webhook) return;                          // 没配 webhook，静默
+      const now = Date.now();
+      const m = pruneErrorCooldown(await getErrorCooldown(), now);
+      if (m[sig] && now - m[sig] < ERROR_REPORT_COOLDOWN_MS) return; // 冷却内，跳过
+      const label = (cfg.machineLabel && String(cfg.machineLabel).trim()) || '未命名机器';
+      const title = '🛑 Temu 插件报错 · ' + label;
+      const lines = [
+        '**机器:** ' + label,
+        '**来源:** ' + ((opts && opts.source) || 'bg'),
+        '**签名:** `' + sig + '`',
+        '',
+        '**消息:**',
+        '```',
+        String(rawMsg).slice(0, 1500),
+        '```',
+        '',
+        '_时间：' + new Date().toLocaleString('zh-CN') + '_',
+      ];
+      // sendFeishu 失败降级为 warn（WARN 不进 ERROR 上报路径，从根断回环）
+      try {
+        await sendFeishu(cfg.webhook, title, lines, 'red');
+      } catch (e) {
+        log.warn('reportError sendFeishu failed: ' + ((e && e.message) || e));
+      }
+      // 无论 send 成败都打冷却戳：飞书侧故障时也别在 30 分钟内重试同签名（防刷屏）
+      m[sig] = now;
+      await chrome.storage.local.set({ [ERROR_REPORT_KEY]: m });
+    } catch (e) {
+      // 上报自身出错：warn，不 error，不回环
+      log.warn('reportErrorToFeishu internal: ' + ((e && e.message) || e));
+    } finally {
+      _reportDepth--;
+    }
+  }).catch(() => {});                                    // 链不断
+}
+
+// ---------------- 前台页面被风控 / 打不开提醒 ----------------
+// v22.2：前台商品页弹人机验证 / 网络打不开时通知飞书，运营去人工过验证或排查网络。
+// 两条入口：
+//  ① content-front detectCaptcha 命中 → frontCapture 带 captcha → 这里发卡；
+//  ② background cycleFrontProducts 新开 tab 超时（waitForFrontCapture 25s 没数据）→
+//     检查 tab 状态，导航失败/错误页也走这里。
+// 独立去重：同一店同一原因 30 分钟内只发一次（复用与报错转发相同的冷却思路，但用单独 storage key，
+// 避免和插件代码报错互相挤占冷却槽）。
+const FRONT_BLOCK_COOLDOWN_MS = 30 * 60 * 1000;
+const FRONT_BLOCK_KEY = 'frontBlockCooldown';
+let frontBlockChain = Promise.resolve();
+
+async function getFrontBlockCooldown() {
+  const { [FRONT_BLOCK_KEY]: m } = await chrome.storage.local.get(FRONT_BLOCK_KEY);
+  return m && typeof m === 'object' ? m : {};
+}
+
+// reason: 'captcha' | 'load-failed'  ；sigKey 区分店+原因（不把 URL 算进签名，避免同店多商品各发一次）
+async function notifyFrontBlocked(store, url, opts) {
+  const reason = (opts && opts.reason) || 'captcha';
+  const info = opts && opts.info ? opts.info : {};
+  const sigKey = store + '|' + reason;
+  frontBlockChain = frontBlockChain.then(async () => {
+    try {
+      const cfg = await getConfig();
+      if (!cfg.webhook) return;
+      const now = Date.now();
+      const m = await getFrontBlockCooldown();
+      // 修剪（保留 2h）
+      const keep = {};
+      for (const k of Object.keys(m)) {
+        if (typeof m[k] === 'number' && now - m[k] < 2 * 60 * 60 * 1000) keep[k] = m[k];
+      }
+      if (keep[sigKey] && now - keep[sigKey] < FRONT_BLOCK_COOLDOWN_MS) return; // 冷却内
+      const label = (cfg.machineLabel && String(cfg.machineLabel).trim()) || '未命名机器';
+      const reasonText = reason === 'captcha'
+        ? '人机验证 / 风控拦截'
+        : '网页打不开 / 加载失败';
+      const lines = [
+        '**机器:** ' + label,
+        '**店铺:** ' + store,
+        '**原因:** ' + reasonText,
+        '**链接:** [' + String(url || '').slice(0, 70) + '](' + url + ')',
+      ];
+      if (info.keyword) lines.push('**命中标志:** ' + info.keyword);
+      if (info.snippet) lines.push('', '**页面片段:**', '> ' + String(info.snippet).slice(0, 180));
+      lines.push('', '_需人工：到该店 Temu 前台过验证 / 检查网络，再点「前台变体全查」复测_');
+      lines.push('_时间：' + new Date().toLocaleString('zh-CN') + '_');
+      try {
+        await sendFeishu(cfg.webhook, '🚫 Temu 前台访问异常 · ' + label, lines, 'red');
+      } catch (e) {
+        log.warn('notifyFrontBlocked sendFeishu failed: ' + ((e && e.message) || e));
+      }
+      keep[sigKey] = now;
+      await chrome.storage.local.set({ [FRONT_BLOCK_KEY]: keep });
+    } catch (e) {
+      log.warn('notifyFrontBlocked internal: ' + ((e && e.message) || e));
+    }
+  }).catch(() => {});
 }
 
 // ---------------- 定时必提醒（每天固定时刻强制汇报各店状态） ----------------
@@ -757,15 +919,18 @@ function isTrustedWatchScan(scan) {
 }
 
 // chip 显示 N 条待关注，但 pool 明细对不齐时需要补扫（不要求 chip 相对高水位上升）
-// - have < chip：少计（本页徽标不全 / 假 seed 后被砍短）
-// - have > chip+1：多计（历史 merge 残留或假全量），需可信筛选整体替换收缩
-function needsWatchRescan(latest, poolLen) {
+// v22.1：chip 含已下架商品，on-sale pool < chip 是常态（Twilight chip=3 / 在售池=2）。
+//   pool<chip 只有在「尚未拿到可信全量」时才补扫；已 trusted 就不再空转（否则 90s 一次、
+//   每次点 chip 干扰轮巡）。pool>chip+1 才是真多计，始终收缩。
+function needsWatchRescan(latest, poolLen, trusted) {
   const chip = typeof latest.trafficWatch === 'number' ? latest.trafficWatch : 0;
   if (chip < 0) return false;
   const have = typeof poolLen === 'number' ? poolLen
     : (Array.isArray(latest.watchItems) ? latest.watchItems.length : 0);
   if (chip === 0) return have > 0; // chip 清零仍留着旧明细 → 扫一次确认清空
-  return have < chip || have > chip + 1;
+  if (have > chip + 1) return true; // 多计（历史 merge 残留 / 假全量）→ 收缩
+  if (!trusted && have < chip) return true; // 被动徽标可能不全 → 补一次可信全量
+  return false;
 }
 
 // 补扫冷却：筛选失败时避免每 2s chipStats 都点一次待关注 chip
@@ -839,15 +1004,16 @@ async function _diffAndAlert(name) {
     const watchNow = typeof latestPeek.trafficWatch === 'number' ? latestPeek.trafficWatch : 0;
     const poolPeekLen = buildTrafficPool(latestPeek).length;
     const chipUp = watchNow > highPeek && watchNow > 0;
-    const needFill = needsWatchRescan(latestPeek, poolPeekLen);
+    const needFill = needsWatchRescan(latestPeek, poolPeekLen, !!snapPeek.trafficScanTrusted);
     const lastRescan = watchRescanAt[name] || 0;
     const cooled = Date.now() - lastRescan >= WATCH_RESCAN_COOLDOWN_MS;
-    // chip 真升高：立即扫（不受补扫冷却限制）；仅 pool 对不齐：走 90s 冷却
-    const shouldScan = chipUp || (needFill && cooled);
-    if (needFill && !chipUp && !cooled) {
-      log.info('scanWatchViaTab skip (cooldown): store=' + name
+    // chip 真升高：立即扫（不受补扫冷却限制）；仅 pool 补扫：走 90s 冷却且轮巡中不扫
+    // （轮巡切店时点 chip 会污染 countStatus、拖累 waitForStoreCapture → 整店 B 扫描被跳）
+    const shouldScan = chipUp || (needFill && cooled && !cycling);
+    if (needFill && !chipUp && (!cooled || cycling)) {
+      log.info('scanWatchViaTab skip: store=' + name
         + ' pool=' + poolPeekLen + ' chip=' + watchNow
-        + ' leftMs=' + (WATCH_RESCAN_COOLDOWN_MS - (Date.now() - lastRescan)));
+        + (cycling ? ' cycling=1' : ' leftMs=' + (WATCH_RESCAN_COOLDOWN_MS - (Date.now() - lastRescan))));
     }
     if (shouldScan) {
       watchRescanAt[name] = Date.now();
@@ -1042,6 +1208,8 @@ async function _diffAndAlert(name) {
     newSnap.alertedTrafficIds = storeAlerted;
     newSnap.alertedWatchIds = storeAlerted;
     newSnap.alertedDeclineIds = storeAlerted;
+    // v22.1：本轮拿到可信全量（list-narrowed）→ 标记，供 needsWatchRescan 判断是否还需补扫
+    if (preScanTrusted) newSnap.trafficScanTrusted = true;
     // 仅正式 seed 时打戳；pool 空 / 仅全局污染 绝不动 trafficBaselineAt
     if (seeded) newSnap.trafficBaselineAt = now;
     const sevMap = Object.assign({}, newSnap.trafficSeverityMap || {});
@@ -1186,6 +1354,105 @@ async function diffProductSkus(name, products) {
     lastAlert: { ts: Date.now(), ok: fr.ok, msg: fr.msg, store: name, kind: 'skuRemoved', lines },
   });
   return removed.length;
+}
+
+// ---------------- 库存变零 ----------------
+// 对每页 pageQuery 的 SKU，对比其 stock（normalizeSku 的 realStock ?: virtualStock）：
+// 前一次 >0、本次 ==0 才算「变零」，发飞书。首轮只 seed 基准不发卡（与 diffProductSkus 一致）。
+// stock 为 null（未知）不参与：避免不可靠数据误报；只对「本页再次出现的商品」对比，避免分页误报。
+async function diffProductStocks(name, products) {
+  if (!Array.isArray(products) || !products.length) return 0;
+  const cfg = await getConfig();
+  const stores = await getStores();
+  const s = stores[name] || { latest: {}, snapshot: {} };
+  const prevMap = (s.snapshot && s.snapshot.productStockMap) || {};
+  const nextMap = Object.assign({}, prevMap);
+  const zeroed = []; // { productId, productName, skc, skuId, name, prevStock }
+
+  for (const p of products) {
+    if (!p || !p.productId) continue;
+    const pid = String(p.productId);
+    const currSkus = Array.isArray(p.skus) ? p.skus : [];
+    // 本页商品 SKU 列表空：可能接口字段漂移/截断，跳过该商品、保留旧基准
+    if (!currSkus.length) continue;
+    const prev = prevMap[pid];
+    const skusObj = {};
+    for (const sk of currSkus) {
+      if (!sk || !sk.skuId) continue;
+      const skuId = String(sk.skuId);
+      skusObj[skuId] = { name: sk.name || '', stock: sk.stock, img: sk.img || '' };
+      const prevSk = prev && prev.skus && prev.skus[skuId];
+      // 前次已知 >0，本次 ==0 → 真「变零」；前次 null 或无基准（首见）不判
+      if (
+        prevSk && typeof prevSk.stock === 'number' && prevSk.stock > 0
+        && typeof sk.stock === 'number' && sk.stock === 0
+      ) {
+        zeroed.push({
+          productId: pid,
+          productName: p.name || prev.name || '',
+          skc: p.skc || prev.skc || '',
+          skuId,
+          name: sk.name || prevSk.name || skuId,
+          prevStock: prevSk.stock,
+        });
+      }
+    }
+    nextMap[pid] = {
+      name: p.name || (prev && prev.name) || '',
+      skc: p.skc || (prev && prev.skc) || '',
+      skus: skusObj,
+      ts: Date.now(),
+    };
+  }
+
+  // 写回基准（合并式：本页商品更新，其它页旧基准保留；串行避免盖掉其它 snapshot 字段）
+  await updateStoreSnapshot(name, { productStockMap: nextMap });
+
+  if (!zeroed.length) return 0;
+  log.info('diffProductStocks: store=' + name + ' products=' + products.length + ' zeroed=' + zeroed.length);
+
+  // 全账号 skuId 冷却：同一 SKU 反复 0↔正 不要每次都刷屏
+  const coolKey = 'stockZeroAlertedGlobal';
+  const { [coolKey]: coolMap0 = {} } = await chrome.storage.local.get(coolKey);
+  const now = Date.now();
+  const { fresh, blocked } = filterByCooldown(zeroed.map((z) => z.skuId), coolMap0, now, ONSALE_ID_COOLDOWN_MS);
+  if (blocked.length) log.info('diffProductStocks: cooldown-blocked=' + blocked.length);
+  if (!fresh.length) return 0;
+  const coolNext = Object.assign({}, coolMap0);
+  for (const id of fresh) coolNext[id] = now;
+  await chrome.storage.local.set({ [coolKey]: coolNext });
+
+  if (!cfg.enabled) return fresh.length;
+
+  // 按商品分组展示
+  const freshSet = new Set(fresh);
+  const byProduct = {};
+  for (const r of zeroed) {
+    if (!freshSet.has(r.skuId)) continue;
+    const k = r.productId;
+    if (!byProduct[k]) byProduct[k] = { productId: k, productName: r.productName, skc: r.skc, skus: [] };
+    byProduct[k].skus.push(r);
+  }
+  const lines = [
+    '**🏬 ' + name + '**',
+    '📦 后台检测到库存变零 SKU **' + fresh.length + '** 个（前次 >0 → 本次 0）',
+    '',
+  ];
+  for (const g of Object.values(byProduct)) {
+    const nm = String(g.productName || '商品').replace(/[[\]]/g, '').slice(0, 30);
+    lines.push('• [' + nm + '](' + editLink(g.productId) + ')' + (g.skc ? '  SKC ' + g.skc : ''));
+    for (const sk of g.skus) {
+      lines.push('   ⚠️ ' + (sk.name || sk.skuId) + '  (原库存 ' + sk.prevStock + '，skuId ' + sk.skuId + ')');
+    }
+  }
+  lines.push('');
+  lines.push('_说明：对比来源 = 商品列表 pageQuery 的 productSkuSummaries 库存（realStock ?: virtualStock）；仅对本页再次出现的商品做比对，避免分页误报。_');
+  lines.push('_检查时间：' + new Date().toLocaleString('zh-CN') + '_');
+  const fr = await sendFeishu(cfg.webhook, '💰 Temu 商品库存变零', lines, 'orange');
+  await chrome.storage.local.set({
+    lastAlert: { ts: Date.now(), ok: fr.ok, msg: fr.msg, store: name, kind: 'stockZero', lines },
+  });
+  return fresh.length;
 }
 
 // 在售清单 diff：找出「上一轮在售、这一轮不在」的商品 = 下架/移出在售，带商品名+编辑链接告警。
@@ -1748,6 +2015,48 @@ async function diffOnSale(name, items, onSaleTabCount, scanStore, scanMeta) {
       return { first: true, delistedIds: [], listedIds: [], nextPending: {}, from: 0, to: Object.keys(newMap).length };
     }
 
+    // v22.3：子集基准恢复到全量时静默重建清单，不发上架点名。
+    // 典型：限流筛选把 onSaleIds 污染成 5，关筛选后扫到 15 → 另外 10 个会被当成「新上架」。
+    // A 路径已有 looksLikeSubsetRecovery 静默抬数量基准；B 路径此前漏防（HomeCove 2026-08-24 19:17 误报）。
+    {
+      const prevN = Object.keys(prevMap).length;
+      const currN = Object.keys(newMap).length;
+      const highWater = (typeof snap.onSaleHighWater === 'number' && snap.onSaleHighWater > 0)
+        ? snap.onSaleHighWater
+        : ((typeof snap.onSaleCount === 'number' && snap.onSaleCount > prevN) ? snap.onSaleCount : null);
+      const recoverSnap = Object.assign({}, snap, {
+        onSaleHighWater: highWater != null ? highWater : snap.onSaleHighWater,
+      });
+      // 恢复形态：清单变大，且符合 A 同款「子集→全量」判定；同时 prev 中绝大多数仍在本轮（不是真换了一批发品）
+      const stillPresent = Object.keys(prevMap).filter((pid) => pid in newMap).length;
+      const prevMostlyKept = prevN === 0 || stillPresent >= Math.ceil(prevN * 0.8);
+      if (currN > prevN && prevMostlyKept && looksLikeSubsetRecovery(prevN, currN, recoverSnap)) {
+        const nextHigh = Math.max(highWater || 0, currN, typeof known === 'number' ? known : 0);
+        s.snapshot = Object.assign({}, snap, {
+          onSaleIds: newMap,
+          onSaleIdsTs: now,
+          pendingOnshelf: {},
+          pendingTrueZero: null,
+          onSaleCount: typeof known === 'number' ? known : currN,
+          onSaleCountTs: now,
+          onSaleHighWater: nextHigh > 0 ? nextHigh : snap.onSaleHighWater,
+        });
+        stores[name] = s;
+        await saveStores(stores);
+        log.info('OnSale list silent recover (subset→full): store=' + name
+          + ' ' + prevN + '→' + currN + ' kept=' + stillPresent + ' high=' + nextHigh);
+        return {
+          first: false,
+          delistedIds: [],
+          listedIds: [],
+          nextPending: {},
+          from: prevN,
+          to: currN,
+          silentRecover: true,
+        };
+      }
+    }
+
     // —— 下架：确认基准有、本轮没有 ——
     const rawDelisted = Object.keys(prevMap).filter((pid) => !(pid in newMap));
     // —— 上架二次确认 ——
@@ -1819,6 +2128,7 @@ async function diffOnSale(name, items, onSaleTabCount, scanStore, scanMeta) {
 
   if (!pack || pack.aborted) return { delisted: 0, listed: 0, aborted: true, reason: pack && pack.reason };
   if (pack.first) return { delisted: 0, listed: 0, first: true };
+  if (pack.silentRecover) return { delisted: 0, listed: 0, silentRecover: true };
 
   // 冷却过滤
   const dCool = filterByCooldown(pack.delistedIds, g.delist, now, ONSALE_ID_COOLDOWN_MS);
@@ -2058,6 +2368,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'log') {
       if (msg.entry && msg.entry.ts && msg.entry.level) {
         TemuLogger._writeEntry(msg.entry);
+        // content / content-front 的 ERROR（含全局未捕获异常监听）转发上报飞书
+        if (msg.entry.level === 'ERROR') {
+          reportErrorToFeishu(msg.entry.msg, { source: 'page' }).catch(() => {});
+        }
       }
       sendResponse({ ok: true });
       return;
@@ -2159,6 +2473,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           });
           // 同 product 内 SKU 消失检测（仅对比本页再次出现的商品，避免分页假下架）
           await diffProductSkus(name, p.products || []);
+          // 同 product 内 SKU 库存变零检测（前次 >0 → 本次 0）
+          await diffProductStocks(name, p.products || []);
         }
       } else if (msg.kind === 'skuSpecList') {
         // 始终保存原始响应便于排障（成功/失败都存）
@@ -2199,6 +2515,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         store = known.find((n) => (d.fullUrl || d.url).toLowerCase().includes(n.toLowerCase())) || null;
       }
       if (!store) { sendResponse({ ok: false, msg: 'URL not configured for any store' }); return; }
+      // v22.2：人机验证 / 页面打不开（content-front detectCaptcha 命中）
+      if (d.captcha) {
+        log.warn('FrontCapture captcha/blocked: store=' + store + ' url=' + d.url);
+        const info = d.captchaInfo || {};
+        await notifyFrontBlocked(store, d.fullUrl || d.url, info);
+        sendResponse({ ok: true, captcha: true, store });
+        return;
+      }
       const key = d.url;
       const { changes } = await withStores(async () => {
         const stores = await getStores();
@@ -2410,7 +2734,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === 'getStatus') {
       sendResponse({
-        bgVersion: 'v22-限流在售不当事全量',
+        bgVersion: 'v22.3-库存归零+B路径假上架静默恢复',
         config: await getConfig(),
         stores: await getStores(),
         ...(await chrome.storage.local.get(['lastAlert', 'lastCycle', 'lastMustRemind', 'lastFrontCycle', 'lastPageSkuSample', 'lastSkuSpecRaw', 'lastSkuSpecRawFail'])),
@@ -2471,6 +2795,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     } catch (e) {
       log.error('Message handler error: ' + (e && e.message ? e.message : String(e)));
+      reportErrorToFeishu('Message handler error: ' + (e && e.message ? e.message : String(e)), { source: 'msg' }).catch(() => {});
       sendResponse({ ok: false, msg: 'Internal error' });
     }
   })();
@@ -2509,7 +2834,10 @@ async function waitForStoreCapture(name, sinceTs, timeout) {
   while (Date.now() - t0 < (timeout || 25000)) {
     const stores = await getStores();
     const L = stores[name] && stores[name].latest;
-    if (L && typeof L.onSale === 'number' && (L.ts || 0) > sinceTs) return true;
+    // 任一 fresh capture（pageQuery 也写 ts）即证明已切到该店。
+    // v22.1：不再要求 onSale——watch filter 残留时 countStatus 被忽略、onSale 永不落地，
+    // 会让轮巡误判 timeout 跳过该店 B 扫描（日志 Agnis/HomeCove ✗）。
+    if (L && (L.ts || 0) > sinceTs) return true;
     await sleep(1500);
   }
   return false;
@@ -2643,6 +2971,8 @@ async function cycleStores(reason) {
     return { ok: true, msg: summary };
   } catch (e) {
     log.error('Cycle error: ' + (e && e.message ? e.message : String(e)));
+    // fire-and-forget：不 await（否则拖延 throw；throw 出去的 rejection 会被全局 unhandledrejection 再抓一次，靠冷却去重收口为单卡）
+    reportErrorToFeishu('Cycle error: ' + (e && e.message ? e.message : String(e)), { source: 'cycle' }).catch(() => {});
     throw e;
   } finally { cycling = false; }
 }
@@ -2658,6 +2988,54 @@ async function pollNow() {
 
 // ---------------- 前台商品页变体轮巡 ----------------
 let frontCycling = false;
+
+// v22.2：等指定 tab 上报一次「有效」frontCapture（带 variants 或 title）。
+// 不再盲 sleep —— content-front 拿到数据会立刻 sendMessage，这里收到即 resolve，
+// 拿不到就等到 timeout 放弃。返回 true=拿到有效数据。
+// captcha 上报虽非有效数据，但已是「content-front 已处理」信号，提前结束等待
+// （返回 false → 调用方走 checkTabLoadFailed；captcha 页 tab 仍在正常 temu 域 →
+//  返回 false → 不再发 load-failed，避免与 captcha 卡重复；captcha 卡已在 frontCapture 分支发）。
+function waitForFrontCapture(tabId, keyBase, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (done) return; done = true; try { chrome.runtime.onMessage.removeListener(listener); } catch (e) {} resolve(ok); };
+    const listener = (msg, sender) => {
+      if (!msg || msg.type !== 'frontCapture' || !msg.data) return;
+      if (!sender || !sender.tab || sender.tab.id !== tabId) return;
+      const d = msg.data;
+      const u = String(d.url || '').split('?')[0];
+      if (u !== keyBase) return;
+      if (d.captcha) finish(false);              // 风控已识别，不白等
+      else if (d.title || (d.variants && d.variants.length)) finish(true); // 有效数据
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
+// v22.2：waitForFrontCapture 超时后，判断 tab 是「真打不开」还是「只是慢渲染」。
+// 真打不开 → notifyFrontBlocked(load-failed)；慢渲染（tab 还在 loading / 正常 temu 域）→ 只 warn 不打扰。
+// 返回 true=判定为加载失败/错误页。
+async function checkTabLoadFailed(tabId) {
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (!t) return true; // tab 已没了
+    const u = String(t.url || '');
+    // chrome 内部错误页 / 空白页
+    if (/^(chrome-error:|chrome:\/\/|about:|edge:\/\/)/i.test(u)) return true;
+    if (!u || u === 'about:blank') return true;
+    // 仍停在非 temu 域（被重定向到错误/拦截页）
+    if (!/https?:\/\/(www\.)?temu\.com/i.test(u)) return true;
+    // title 是经典错误标题
+    const title = String(t.title || '');
+    if (/error|无法|not found|can't be reached|未连接|ERR_/i.test(title)) return true;
+    return false; // 正常 temu 域、title 不像错误 → 当作慢渲染
+  } catch (e) {
+    // tab.get 抛错通常意味着 tab 已关闭 → 当失败
+    return true;
+  }
+}
+
 async function cycleFrontProducts(reason) {
   if (frontCycling) { log.info('FrontCycle skipped: already running'); return; }
   frontCycling = true;
@@ -2674,22 +3052,46 @@ async function cycleFrontProducts(reason) {
     log.info('FrontCycle: checking ' + allUrls.length + ' URLs across ' + Object.keys(productUrls).length + ' stores');
 
     let checked = 0;
+    let okCount = 0;
     for (const { store, url } of allUrls) {
+      const keyBase = String(url).split('?')[0];
       try {
         let tab = null;
         try {
           const tabs = await chrome.tabs.query({ url: 'https://www.temu.com/*' });
-          tab = tabs.find((t) => ((t.url || '').split('?')[0]) === url) || null;
+          tab = tabs.find((t) => ((t.url || '').split('?')[0]) === keyBase) || null;
         } catch (e) { /* ignore */ }
 
         if (tab) {
           log.info('FrontCycle: reusing tab for ' + url.slice(0, 60));
-          await sendTabRetry(tab.id, { cmd: 'frontCheck' }, 3);
-          await sleep(6000); // 等 content-front 解析+上报
+          // 先挂监听再发 frontCheck，避免响应和消息竞态
+          const waitP = waitForFrontCapture(tab.id, keyBase, 18000);
+          const resp = await sendTabRetry(tab.id, { cmd: 'frontCheck', budgetMs: 15000 }, 3);
+          // frontCheck 响应里 hasData=true 就已上报成功；否则等监听兜底
+          let got = !!(resp && resp.hasData);
+          if (!got) got = await waitP;
+          if (got) okCount++;
+          else {
+            log.warn('FrontCycle: no valid data from reused tab for ' + url.slice(0, 60));
+            // v22.2：复用 tab 也可能被风控/打不开（用户停留在错误页），同样检查并提醒
+            if (await checkTabLoadFailed(tab.id)) {
+              await notifyFrontBlocked(store, url, { reason: 'load-failed' });
+            }
+          }
         } else {
           log.info('FrontCycle: opening tab for ' + url.slice(0, 60));
           const newTab = await chrome.tabs.create({ url, active: false });
-          await sleep(12000); // 等 SPA 渲染(2.5s) + 解析 + 上报，留足余量
+          // content-front init 自带重试；这里等到它真上报成功或 25s 超时
+          const got = await waitForFrontCapture(newTab.id, keyBase, 25000);
+          if (got) okCount++;
+          else {
+            log.warn('FrontCycle: no valid data from new tab for ' + url.slice(0, 60));
+            // v22.2：新开 tab 超时 → 判网页打不开（网络/风控），提醒飞书
+            // （content-front 若已检测到 captcha 会走 frontCapture.captcha 自行提醒；
+            //  这里兜的是「连 content-front 都没注入/没上报」的纯加载失败）
+            const failed = await checkTabLoadFailed(newTab.id);
+            if (failed) await notifyFrontBlocked(store, url, { reason: 'load-failed' });
+          }
           try { await chrome.tabs.remove(newTab.id); } catch (e) { /* ignore */ }
         }
         checked++;
@@ -2697,10 +3099,11 @@ async function cycleFrontProducts(reason) {
         log.warn('FrontCycle: error checking ' + url.slice(0, 60) + ': ' + (e && e.message || e));
       }
     }
-    log.info('FrontCycle completed: checked=' + checked + '/' + allUrls.length);
-    await chrome.storage.local.set({ lastFrontCycle: { ts: Date.now(), reason, checked, total: allUrls.length } });
+    log.info('FrontCycle completed: checked=' + checked + '/' + allUrls.length + ' ok=' + okCount);
+    await chrome.storage.local.set({ lastFrontCycle: { ts: Date.now(), reason, checked, total: allUrls.length, ok: okCount } });
   } catch (e) {
     log.error('FrontCycle error: ' + (e && e.message ? e.message : String(e)));
+    reportErrorToFeishu('FrontCycle error: ' + (e && e.message ? e.message : String(e)), { source: 'frontCycle' }).catch(() => {});
   } finally { frontCycling = false; }
 }
 
@@ -2727,6 +3130,7 @@ chrome.alarms.onAlarm.addListener((a) => {
         await sendMustRemind(slot);
       } catch (e) {
         log.error('MustRemind error: ' + (e && e.message ? e.message : String(e)));
+        reportErrorToFeishu('MustRemind error: ' + (e && e.message ? e.message : String(e)), { source: 'mustRemind' }).catch(() => {});
       } finally {
         await setupMustRemindAlarms();
       }
@@ -2761,6 +3165,22 @@ chrome.runtime.onStartup.addListener(() => { log.info('Chrome startup, setting u
 chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.config) { log.info('Config changed, reconfiguring alarm'); setupAlarm(); } });
 
 log.info('Service worker started');
+// 全局兜底：SW 未捕获的 error / 未处理的 promise rejection 也尽力上报飞书。
+// （SW 被强杀那一刻来不及发，可接受；能在 SW 仍存活时捕到的都发。）
+self.addEventListener('error', (ev) => {
+  try {
+    const m = ev && ev.message ? ev.message : 'unknown error';
+    const loc = ev && ev.filename ? (' @ ' + ev.filename + ':' + (ev.lineno || 0)) : '';
+    reportErrorToFeishu('SW uncaught: ' + m + loc, { source: 'global' }).catch(() => {});
+  } catch (e) { /* ignore */ }
+});
+self.addEventListener('unhandledrejection', (ev) => {
+  try {
+    const r = ev && ev.reason;
+    const m = (r && r.message) ? r.message : String(r);
+    reportErrorToFeishu('SW unhandledrejection: ' + m, { source: 'global' }).catch(() => {});
+  } catch (e) { /* ignore */ }
+});
 // SW 被唤醒时：清理历史假店 + 补闹钟
 cleanupFakeStores().catch((e) => log.warn('cleanupFakeStores: ' + (e && e.message || e)));
 setupAlarm();

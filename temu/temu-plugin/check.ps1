@@ -64,7 +64,9 @@ $tests = @(
   'test_traffic_dedupe.js',
   'test_onsale_ab.js',
   'test_timelines.js',
-  'test_sku_parse.js'
+  'test_sku_parse.js',
+  'test_error_report.js',
+  'test_front_captcha.js'
 )
 
 foreach ($t in $tests) {
@@ -83,11 +85,11 @@ foreach ($t in $tests) {
 # Soft checks: version string consistency (warn only on options mismatch)
 Step 'bgVersion marker present' {
   $bg = Get-Content -LiteralPath (Join-Path $Root 'background.js') -Raw -Encoding UTF8
-  if ($bg -notmatch "bgVersion:\s*'v19\.") {
-    throw 'background.js getStatus bgVersion missing or not v19.x'
+  if ($bg -notmatch "bgVersion:\s*'v22\.") {
+    throw 'background.js getStatus bgVersion missing or not v22.x'
   }
-  if ($bg -notmatch 'v19\.4') {
-    Write-Host '  warn: background.js may not mention v19.4' -ForegroundColor Yellow
+  if ($bg -notmatch 'v22\.3') {
+    Write-Host '  warn: background.js may not mention v22.3' -ForegroundColor Yellow
   }
   $mf = Get-Content -LiteralPath (Join-Path $Root 'manifest.json') -Raw -Encoding UTF8
   if ($mf -notmatch '"version"\s*:\s*"0\.2\.') {

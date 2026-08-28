@@ -320,13 +320,15 @@ function isTrustedWatchScan(scan) {
   if (chip != null && chip >= 0 && n > chip + 1) return false;
   return true;
 }
-function needsWatchRescan(latest, poolLen) {
+function needsWatchRescan(latest, poolLen, trusted) {
   const chip = typeof latest.trafficWatch === 'number' ? latest.trafficWatch : 0;
   if (chip < 0) return false;
   const have = typeof poolLen === 'number' ? poolLen
     : (Array.isArray(latest.watchItems) ? latest.watchItems.length : 0);
   if (chip === 0) return have > 0;
-  return have < chip || have > chip + 1;
+  if (have > chip + 1) return true;
+  if (!trusted && have < chip) return true;
+  return false;
 }
 function decideScanWatchApplied(opts) {
   const before = opts.before;
@@ -454,16 +456,21 @@ function decideScanWatchApplied(opts) {
   assert(replaced.length === 1, 'v21-14: trusted replace may shrink');
 }
 
-// 15) needsWatchRescan：pool < chip 或 pool ≫ chip
+// 15) needsWatchRescan：v22.1 —— pool<chip 仅未 trusted 时补扫；已 trusted 不再空转
 {
-  assert(needsWatchRescan({ trafficWatch: 3, watchItems: [{ productId: '1' }] }, 1),
-    'v21-15: pool1 < chip3 → rescan');
-  assert(!needsWatchRescan({ trafficWatch: 3, watchItems: [{ productId: '1' }, { productId: '2' }, { productId: '3' }] }, 3),
-    'v21-15: pool==chip no rescan');
-  assert(needsWatchRescan({ trafficWatch: 3 }, 12),
-    'v21-15: pool12 > chip3 → rescan to shrink');
-  assert(needsWatchRescan({ trafficWatch: 0, watchItems: [{ productId: '1' }] }, 1),
-    'v21-15: chip0 leftover → rescan');
+  // 未 trusted：pool1 < chip3 → 补扫
+  assert(needsWatchRescan({ trafficWatch: 3, watchItems: [{ productId: '1' }] }, 1, false),
+    'v22.1-15: untrusted pool1 < chip3 → rescan');
+  // 已 trusted：chip 含下架，pool2 < chip3 是常态，不再空转
+  assert(!needsWatchRescan({ trafficWatch: 3 }, 2, true),
+    'v22.1-15: trusted pool2 < chip3 → no rescan (chip含下架)');
+  assert(!needsWatchRescan({ trafficWatch: 3, watchItems: [{ productId: '1' }, { productId: '2' }, { productId: '3' }] }, 3, false),
+    'v22.1-15: pool==chip no rescan');
+  // pool 明显多于 chip：无论 trusted 与否都收缩
+  assert(needsWatchRescan({ trafficWatch: 3 }, 12, true),
+    'v22.1-15: pool12 > chip3 → rescan to shrink');
+  assert(needsWatchRescan({ trafficWatch: 0, watchItems: [{ productId: '1' }] }, 1, true),
+    'v22.1-15: chip0 leftover → rescan');
 }
 
 // 16) seed 护栏：pool≫chip 拒绝

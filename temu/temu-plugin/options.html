@@ -23,6 +23,10 @@
   <input type="text" id="storeName" placeholder="例如：Trendful Treasures" />
   <div class="hint">填了会显示在飞书告警里，方便区分是哪个店。留空则显示「当前店铺」。</div>
 
+  <label>机器名标签（报错转发用）</label>
+  <input type="text" id="machineLabel" placeholder="例如：运营机" />
+  <div class="hint">插件报错时，飞书卡片标题会带上这个标签，方便区分是哪台电脑。留空显示「未命名机器」。</div>
+
   <label>检查间隔（分钟）</label>
   <input type="number" id="interval" min="1" value="15" />
   <div class="hint">插件会每隔这么久自动刷新一次后台商品页并检查（需保持 Chrome 开着、Temu 已登录）。</div>

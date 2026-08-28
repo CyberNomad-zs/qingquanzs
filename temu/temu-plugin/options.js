@@ -3,6 +3,7 @@ const DEFAULT = {
   intervalMinutes: 15,
   enabled: true,
   storeName: '',
+  machineLabel: '',
   mustRemindEnabled: true,
   mustRemindTimes: ['09:30', '16:30'],
   feishuAppId: '',
@@ -43,6 +44,7 @@ async function load() {
   const c = Object.assign({}, DEFAULT, config || {});
   document.getElementById('webhook').value = c.webhook || '';
   document.getElementById('storeName').value = c.storeName || '';
+  document.getElementById('machineLabel').value = c.machineLabel || '';
   document.getElementById('interval').value = c.intervalMinutes || 15;
   document.getElementById('enabled').checked = c.enabled !== false;
   document.getElementById('mustRemindEnabled').checked = c.mustRemindEnabled !== false;
@@ -63,6 +65,7 @@ document.getElementById('save').addEventListener('click', async () => {
   const config = {
     webhook: document.getElementById('webhook').value.trim(),
     storeName: document.getElementById('storeName').value.trim(),
+    machineLabel: document.getElementById('machineLabel').value.trim(),
     intervalMinutes: Math.max(1, Number(document.getElementById('interval').value) || 15),
     enabled: document.getElementById('enabled').checked,
     mustRemindEnabled: document.getElementById('mustRemindEnabled').checked,

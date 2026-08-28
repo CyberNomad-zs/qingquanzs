@@ -6,14 +6,14 @@
 
 | 目录 | 说明 | 状态 |
 |------|------|------|
-| [`temu-plugin/`](temu-plugin/) | **Chrome 扩展（推荐）** — 装在同事日常浏览器里，复用已有登录态 | 当前主力（v19.3） |
+| [`temu-plugin/`](temu-plugin/) | **Chrome 扩展（推荐）** — 装在同事日常浏览器里，复用已有登录态 | 当前主力（v22.3 · manifest `0.2.17`） |
 | [`temu-monitor/`](temu-monitor/) | 赛狐服务器上下架 + Playwright 应急 | 赛狐生产常驻；Playwright 仅应急 |
 
 **维护者请先读：**
 
 - [技术路线图（详版）](ROADMAP.md) — 架构演进、改版原因、bug 与修法  
 - [告警 SLO](SLO.md) — P0/P1、双通道策略 A、何时热修  
-- [能力分工](temu-monitor/PLUGIN_PARITY.md) — 插件 v19.3 + 赛狐  
+- [能力分工](temu-monitor/PLUGIN_PARITY.md) — 插件 v22.3 + 赛狐  
 
 同事装机见 [`temu-plugin/使用说明.txt`](temu-plugin/使用说明.txt)。发版闸门：`temu-plugin/check.ps1`。
 

@@ -1,7 +1,7 @@
 ﻿{
   "manifest_version": 3,
   "name": "Temu 店铺监测",
-  "version": "0.2.13",
+  "version": "0.2.17",
   "description": "监测 Temu 限流（严重/一般）+ 在售数量/点名上下架（A+B，与服务器赛狐互补），即时+定点汇总发飞书。",
   "permissions": [
     "storage",

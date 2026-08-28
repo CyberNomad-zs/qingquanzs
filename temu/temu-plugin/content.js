@@ -5,6 +5,29 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   LOG.info('content.js loaded -- v22');
 
+  // 全局未捕获异常上报：走 LOG.error → sendToBg → SW 的 msg.type==='log' ERROR 分支 → 飞书。
+  // content.js 是声明式注入、SPA 切店不重载 document，IIFE 只跑一次，监听不会重复挂。
+  function _fmtErr(e) {
+    try {
+      if (e && e.message) return (e.name || 'Error') + ': ' + e.message;
+      return String(e);
+    } catch (_) { return 'unserializable error'; }
+  }
+  window.addEventListener('error', (ev) => {
+    try {
+      const m = (ev && ev.error) ? _fmtErr(ev.error)
+        : ((ev && ev.message) ? ev.message : 'unknown');
+      const loc = ev && ev.filename ? (' @ ' + ev.filename + ':' + (ev.lineno || 0)) : '';
+      LOG.error('content uncaught: ' + m + loc);
+    } catch (_) {}
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    try {
+      const r = ev && ev.reason;
+      LOG.error('content unhandledrejection: ' + _fmtErr(r));
+    } catch (_) {}
+  });
+
   // 页面操作互斥锁：scanWatchList/scanOnSaleList/switchTo 都会改动「快速筛选/tab/切店」状态，
   // 绝不能并发——否则「商品流量待关注」筛选一打开，并发的在售扫描就只扫到筛选后的几条，
   // 误判成「下架 N 个」（这是历史假告警「在售 13→3」的根因）。所有改动型指令排队串行执行。

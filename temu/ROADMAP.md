@@ -4,7 +4,7 @@
 > 同事装机说明见 `temu-plugin/使用说明.txt`；赛狐部署见 `temu-monitor/SELLFOX.md`、`temu-monitor/deploy/README-SERVER.md`。  
 > 告警标准见 **`SLO.md`**（双通道策略 A：都报、文案区分、接受偶尔两张）。能力表见 `temu-monitor/PLUGIN_PARITY.md`。  
 > 发版闸门：`temu-plugin/check.ps1`（含 `test_timelines.js`）。  
-> 文档日期：2026-08-06。当前插件 popup 应显示 **`后台：v19.3-mallId绑店`**（manifest `0.2.7`）。
+> 文档日期：2026-08-28。当前插件 popup 应显示 **`后台：v22.3-库存归零+B路径假上架静默恢复`**（manifest `0.2.17`）。历史演进仍以下文 v14–v19 为骨架；v20 起见 `temu-plugin/background.js` 文件头与 `使用说明.txt`。
 
 ---
 
@@ -21,12 +21,12 @@
 
 | 通道 | 目录 / 单元 | 职责 | 状态 |
 |------|-------------|------|------|
-| 同事日常 Chrome | `temu-plugin/` | 限流分级 + 在售 A+B 兜底 + 09:30/16:30 必提醒 + 空闲多店轮巡 | **主力** v19.3 |
+| 同事日常 Chrome | `temu-plugin/` | 限流分级 + 在售 A+B 兜底 + 09:30/16:30 必提醒 + 空闲多店轮巡 + 报错/风控/库存归零 | **主力** v22.3 |
 | 固定 IP 服务器 | systemd `temu-sellfox` ← `temu-monitor/src/sellfox/` | 赛狐 `selectStatus=12` 上下架点名 | **生产常驻** |
 | 本机 Playwright | `temu-monitor/src/*.js` | 应急流量 / DOM 回归 | **停发日常**；勿与插件同飞书双开 |
 
 ```
-同事 Chrome (plugin v19.3)
+同事 Chrome (plugin v22.3)
   ├─ 限流：在售 ∩ (待关注|下降) → VIP*/JM*+热销 分级
   ├─ 切店：chip 高水位 + productId 静默吸收 + withStores 串行
   ├─ 在售 A：countStatus + mallId 绑店 + pendingQty 防抖

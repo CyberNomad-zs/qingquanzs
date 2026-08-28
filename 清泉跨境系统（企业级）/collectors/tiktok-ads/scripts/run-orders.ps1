@@ -20,11 +20,20 @@ if (-not $ConfigPath) { $ConfigPath = Join-Path $root 'config\stores.config.json
 $scrapeJsPath = Join-Path $root 'scripts\scrape-orders-page.js'
 $clickNextJsPath = Join-Path $root 'scripts\orders-click-next.js'
 $detailJsPath = Join-Path $root 'scripts\scrape-order-detail-page.js'
+$dateRangeJsPath = Join-Path $root 'scripts\set-date-range.js'
+$ordersDateFilterJsPath = Join-Path $root 'scripts\set-orders-date-filter.js'
 if (-not (Test-Path $ConfigPath)) { throw "Missing config: $ConfigPath" }
 if (-not (Test-Path $scrapeJsPath)) { throw "Missing $scrapeJsPath" }
 
 $cfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $scrapeJs = Get-Content $scrapeJsPath -Raw -Encoding UTF8
+# 2026-08-20：订单列表默认 tab=all（全部订单），不按日期筛。每次全量翻页 + 进前 N 个详情，
+# 大量历史订单每天重抓，靠幂等去重但采集开销全量重复。加载 set-date-range.js 用于在 visit
+# 订单页后把日期区间选成「昨天」，使列表只出昨天的订单，详情也只补昨天的。
+$dateRangeJsTemplate = ''
+if (Test-Path $dateRangeJsPath) { $dateRangeJsTemplate = Get-Content $dateRangeJsPath -Raw -Encoding UTF8 }
+$ordersDateFilterJsTemplate = ''
+if (Test-Path $ordersDateFilterJsPath) { $ordersDateFilterJsTemplate = Get-Content $ordersDateFilterJsPath -Raw -Encoding UTF8 }
 $clickNextJs = ''
 if (Test-Path $clickNextJsPath) {
   $clickNextJs = Get-Content $clickNextJsPath -Raw -Encoding UTF8
@@ -162,6 +171,192 @@ function Get-ScrapePayload([string]$execOut) {
   return $null
 }
 
+# 2026-08-24 方案3：订单页筛选抽屉日期过滤（set-orders-date-filter.js）。
+# 降级设计：选不上不阻断，按当前页抓 + ordersOnlyYesterday 安全网兜底。
+function Get-OrdersFilterScriptOneLine([string]$action) {
+  $js = $ordersDateFilterJsTemplate.Replace('__ACTION__', $action)
+  return (ConvertTo-ScrapeOneLine $js)
+}
+function Invoke-OrdersFilterAction([string]$storeId, [string]$action, [int]$timeoutMs = 20000) {
+  $scriptLine = Get-OrdersFilterScriptOneLine $action
+  $out = Invoke-Ziniao @('page', 'exec', '--store-id', $storeId, '--script', $scriptLine, '--timeout', ([string]$timeoutMs))
+  return (Get-ScrapePayload $out)
+}
+function Get-DateRangeScriptOneLine([string]$action) {
+  $js = $dateRangeJsTemplate.Replace('__DATE_MODE__', $dateMode).Replace('__ACTION__', $action)
+  return (ConvertTo-ScrapeOneLine $js)
+}
+function Invoke-DateRangeAction([string]$storeId, [string]$action, [int]$timeoutMs = 20000) {
+  $scriptLine = Get-DateRangeScriptOneLine $action
+  $out = Invoke-Ziniao @('page', 'exec', '--store-id', $storeId, '--script', $scriptLine, '--timeout', ([string]$timeoutMs))
+  return (Get-ScrapePayload $out)
+}
+function Invoke-SetPageDateRange([string]$storeId) {
+  if (-not $setPageDateRange) {
+    Write-Step "  skip set page date range (setPageDateRange=false or no script)"
+    return $true
+  }
+  # 方案3优先：用筛选抽屉脚本
+  if ($ordersDateFilterJsTemplate) {
+    Write-Step ("  set orders date filter => {0} (filter drawer: open -> pick -> wait)..." -f $dateMode)
+    try {
+      # 1) 打开筛选抽屉
+      $op = Invoke-OrdersFilterAction $storeId 'open' 20000
+      if ($null -eq $op) {
+        Write-Step "  WARN filter open: unrecognized payload"
+      } elseif ($op.alreadyOpen) {
+        Write-Step "  filter drawer already open"
+      } elseif ($op.ok) {
+        Write-Step ("  filter drawer opened via={0}" -f $op.triggerVia)
+      } else {
+        Write-Step ("  WARN filter open failed: {0}" -f $(if ($op.error) { $op.error } else { $op.message }))
+        return $false
+      }
+      Start-Sleep -Milliseconds 800
+      # 2) 选昨天 + 应用
+      $pk = Invoke-OrdersFilterAction $storeId 'pick' 20000
+      if ($null -eq $pk) {
+        Write-Step "  WARN filter pick: unrecognized payload (will still scrape)"
+      } elseif ($pk.ok) {
+        Write-Step ("  filter pick OK: shortcut={0} applied={1}" -f $pk.shortcutText, $pk.applied)
+      } elseif ($pk.softOk) {
+        Write-Step ("  filter pick partial: shortcut={0} but apply not found" -f $pk.shortcutText)
+      } else {
+        Write-Step ("  WARN filter pick failed: {0}" -f $(if ($pk.error) { $pk.error } else { $pk.message }))
+      }
+      # 3) 等页面按筛选条件重载
+      if ($waitAfterDateChangeMs -gt 0) {
+        Write-Step ("  wait after filter apply {0}ms (page reload)..." -f $waitAfterDateChangeMs)
+        Start-Sleep -Milliseconds $waitAfterDateChangeMs
+      }
+      return ($pk -and ($pk.ok -or $pk.softOk))
+    } catch {
+      Write-Step ("  WARN set orders date filter error: {0} (will scrape current page)" -f $_)
+      return $false
+    }
+  }
+  # 方案1 回退（旧 set-date-range.js，留作调试）
+  Write-Step ("  set page date range => {0} (open -> pick -> wait)..." -f $dateMode)
+  try {
+    $st = Invoke-DateRangeAction $storeId 'status' 15000
+    if ($st -and $st.matched) {
+      Write-Step ("  date range already {0}: {1} ~ {2}" -f $dateMode, $st.range.start, $st.range.end)
+      return $true
+    }
+    if ($st -and $st.range) {
+      Write-Step ("  current page range: {0} ~ {1}" -f $st.range.start, $st.range.end)
+    }
+    $op = Invoke-DateRangeAction $storeId 'open' 20000
+    if ($null -eq $op) {
+      Write-Step "  WARN date open: unrecognized payload"
+    } elseif (-not $op.ok -and -not $op.skipped) {
+      Write-Step ("  WARN date open failed: {0}" -f $(if ($op.error) { $op.error } else { 'unknown' }))
+    } else {
+      Write-Step ("  date picker open panelOpen={0}" -f $op.panelOpen)
+    }
+    Start-Sleep -Milliseconds 600
+    $pk = Invoke-DateRangeAction $storeId 'pick' 20000
+    if ($null -eq $pk) {
+      Write-Step "  WARN date pick: unrecognized payload (will still scrape)"
+    } elseif ($pk.skipped) {
+      Write-Step ("  date range already {0}" -f $dateMode)
+      return $true
+    } elseif ($pk.ok -or $pk.softOk) {
+      $beforeTxt = if ($pk.before) { "{0}~{1}" -f $pk.before.start, $pk.before.end } else { '?' }
+      $afterTxt = if ($pk.after) { "{0}~{1}" -f $pk.after.start, $pk.after.end } else { '(pending reload)' }
+      Write-Step ("  date pick clicked={0} before={1} after={2}" -f $pk.clicked, $beforeTxt, $afterTxt)
+    } else {
+      Write-Step ("  WARN date pick failed: {0}" -f $(if ($pk.error) { $pk.error } else { 'unknown' }))
+    }
+    if ($waitAfterDateChangeMs -gt 0) {
+      Write-Step ("  wait after date change {0}ms (table reload)..." -f $waitAfterDateChangeMs)
+      Start-Sleep -Milliseconds $waitAfterDateChangeMs
+    }
+    $st2 = Invoke-DateRangeAction $storeId 'status' 15000
+    if ($st2 -and $st2.matched) {
+      Write-Step ("  date range confirmed: {0} ~ {1}" -f $st2.range.start, $st2.range.end)
+      return $true
+    }
+    if ($st2 -and $st2.range) {
+      Write-Step ("  WARN date after pick still {0} ~ {1} (target {2}); will scrape current page anyway" -f `
+        $st2.range.start, $st2.range.end, $dateMode)
+      return $false
+    }
+    Write-Step "  WARN could not confirm date range after pick; will scrape current page anyway"
+    return $false
+  } catch {
+    Write-Step ("  WARN set page date range error: {0} (will scrape current page)" -f $_)
+    return $false
+  }
+}
+
+# ===== 方案2：翻页按订单 orderTime 早于昨天即停（2026-08-21）=====
+# 订单页 /order 没有日期区间控件（方案1 set-date-range.js 套不上，见上文实测注释）。
+# 订单按创建时间倒序排列，每条带 createTime 文本（今天/昨天/X分钟前/X天前/星期X/绝对日期）。
+# 方案2：翻页时逐条把 createTime 换算成 UK 时区绝对日期，只保留「昨天」的单；
+#        一旦出现「前天及更早」的单，说明昨天的单已全部在前面页里，停止翻页。
+# 参照系 = UK 时区（GMT Standard Time，自动 BST/GMT 切换），不是本机时区（本机 UTC+8 会和 UK 错位一天）。
+function Get-UKTimeZone {
+  try { return [System.TimeZoneInfo]::FindSystemTimeZoneById('GMT Standard Time') }
+  catch { return [System.TimeZoneInfo]::Utc }
+}
+function Get-UKNow {
+  return [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, (Get-UKTimeZone))
+}
+# 把 TikTok UK 后台相对时间文本换算成 UK 时区绝对日期 (yyyy-MM-dd)。无法解析返回 $null。
+function Convert-OrderTimeToDate {
+  param([string]$Raw)
+  if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+  $s = [string]$Raw
+  $s = $s -replace '57\d{16}', ' '        # 剥离粘连的订单号
+  $s = $s -replace '\b\d{15,20}\b', ' '
+  $s = ($s -replace '\s+', ' ').Trim()
+  if (-not $s) { return $null }
+  $ukNow = Get-UKNow
+  $ukToday = $ukNow.Date
+  $m = $null
+  if ($s -match '(\d{1,4})\s*分钟前') { return ([DateTime]$ukNow).AddMinutes(-[int]$Matches[1]).Date }
+  if ($s -match '(\d{1,4})\s*小时前') { return ([DateTime]$ukNow).AddHours(-[int]$Matches[1]).Date }
+  if ($s -match '(\d{1,3})\s*天前')   { return $ukToday.AddDays(-[int]$Matches[1]) }
+  if ($s -match '昨天') { return $ukToday.AddDays(-1) }
+  if ($s -match '今天') { return $ukToday }
+  # 星期X/周X → 本周最近的该星期几，不晚于今天
+  $weekMap = @{
+    '星期一' = 1; '周一' = 1; '星期二' = 2; '周二' = 2; '星期三' = 3; '周三' = 3
+    '星期四' = 4; '周四' = 4; '星期五' = 5; '周五' = 5; '星期六' = 6; '周六' = 6
+    '星期日' = 7; '周日' = 7; '星期天' = 7; '周天' = 7
+  }
+  $matchedDay = $null
+  foreach ($k in $weekMap.Keys) { if ($s.IndexOf($k) -ge 0) { $matchedDay = $weekMap[$k]; break } }
+  if ($null -ne $matchedDay) {
+    $todayDow = [int]$ukToday.DayOfWeek; if ($todayDow -eq 0) { $todayDow = 7 }
+    $diff = $matchedDay - $todayDow
+    if ($diff -gt 0) { $diff -= 7 }   # 该星期几在今周未来 → 取上周
+    return $ukToday.AddDays($diff)
+  }
+  if ($s -match '(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})') {
+    try { return ([DateTime]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], 12, 0, 0)).Date } catch { return $null }
+  }
+  return $null
+}
+# 对一条订单的 createTime 做过滤判定。返回 hashtable：
+#   keep            = 是否收入 rawRows（只收昨天；今天的单不收，因为今天未结束；
+#                     解析失败 null 保守收入，避免丢单）
+#   beforeYesterday = 是否早于昨天（用于触发停止翻页；解析失败不触发，避免误停）
+#   date            = 换算出的 UK 绝对日期（null 表示解析不出）
+#   todayYmd        = UK 今天 yyyy-MM-dd（调试用）
+function Test-OrderDateRange {
+  param([string]$CreateTime, $UKToday)
+  $date = Convert-OrderTimeToDate -Raw $CreateTime
+  $yest = $UKToday.AddDays(-1)
+  if ($null -eq $date) {
+    return @{ keep = $true; beforeYesterday = $false; date = $null; todayYmd = $UKToday.ToString('yyyy-MM-dd') }
+  }
+  $keep = ($date.Date -eq $yest.Date)
+  $before = ($date.Date -lt $yest.Date)
+  return @{ keep = $keep; beforeYesterday = $before; date = $date.ToString('yyyy-MM-dd'); todayYmd = $UKToday.ToString('yyyy-MM-dd') }
+}
+
 function Convert-DryRunFlag([string]$raw) {
   if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
   switch -Regex ($raw.Trim()) {
@@ -295,13 +490,37 @@ if ($cfg.options -and $null -ne $cfg.options.orderDetailWaitMs) {
   $orderDetailWaitMs = [Math]::Max(1500, [int]$cfg.options.orderDetailWaitMs)
 }
 if (-not $detailJs) { $orderDetailEnabled = $false }
+
+# 2026-08-20：方案1（复用 set-date-range.js arco-picker 选昨天）在订单页失败，无 arco-picker。
+# 2026-08-21：方案2（翻页按 orderTime 停）落地。
+# 2026-08-24：方案3（点筛选抽屉→订单创建时间→昨天→应用），替代方案1。
+# 订单页的日期选择器藏在「筛选」按钮的右侧抽屉面板内，不是页面顶部直接露出的 arco-picker。
+# 新脚本 set-orders-date-filter.js 专门处理这个 UI。方案2 保留为安全网。
+$dateMode = 'yesterday'
+if ($cfg.options -and $cfg.options.dateMode) {
+  $dm = ([string]$cfg.options.dateMode).Trim().ToLowerInvariant()
+  if ($dm -eq 'today' -or $dm -eq 'yesterday') { $dateMode = $dm }
+}
+$setPageDateRange = $true
+if ($cfg.options -and $null -ne $cfg.options.setPageDateRange) { $setPageDateRange = [bool]$cfg.options.setPageDateRange }
+$waitAfterDateChangeMs = 8000
+if ($cfg.options -and $null -ne $cfg.options.waitAfterDateChangeMs) { $waitAfterDateChangeMs = [int]$cfg.options.waitAfterDateChangeMs }
+if (-not $ordersDateFilterJsTemplate -and -not $dateRangeJsTemplate) { $setPageDateRange = $false }
+# 方案2 安全网：翻页按 orderTime 早于昨天即停，双保险。
+# 参照系 UK 时区（本机 UTC+8 与 UK 错位一天，函数内用 GMT Standard Time 纠正）。
+$ordersOnlyYesterday = $true
+if ($cfg.options -and $null -ne $cfg.options.ordersOnlyYesterday) {
+  $ordersOnlyYesterday = [bool]$cfg.options.ordersOnlyYesterday
+}
+#昨天边界（UK 时区），循环开始时重算一次即可；这里先占位，进店循环里赋值
+$ukTodayDate = $null
 $scrapeOneLine = ConvertTo-ScrapeOneLine $scrapeJs
 $clickNextOneLine = ''
 if ($clickNextJs) { $clickNextOneLine = ConvertTo-ScrapeOneLine $clickNextJs }
 $detailOneLine = ''
 if ($detailJs) { $detailOneLine = ConvertTo-ScrapeOneLine $detailJs }
-Write-Step ("dryRun={0} scrapeLen={1} orderMaxPages={2} pageWaitMs={3} detail={4} detailMax={5}" -f `
-  $useDryRun, $scrapeOneLine.Length, $orderMaxPages, $orderPageWaitMs, $orderDetailEnabled, $orderDetailMax)
+Write-Step ("dryRun={0} scrapeLen={1} orderMaxPages={2} pageWaitMs={3} detail={4} detailMax={5} dateMode={6} setPageDateRange={7} onlyYesterday={8}" -f `
+  $useDryRun, $scrapeOneLine.Length, $orderMaxPages, $orderPageWaitMs, $orderDetailEnabled, $orderDetailMax, $dateMode, $setPageDateRange, $ordersOnlyYesterday)
 
 $summary = @()
 foreach ($store in $selected) {
@@ -326,11 +545,21 @@ foreach ($store in $selected) {
     Invoke-ZiniaoStoreMaximize -StoreId $sid -InvokeZiniao ${function:Invoke-Ziniao} -WriteStep ${function:Write-Step} -Config $cfg | Out-Null
     Start-Sleep -Milliseconds $waitVisit
 
+    # 方案3：筛选抽屉选昨天 + 应用；选不上不阻断（ordersOnlyYesterday 兜底）。
+    $null = Invoke-SetPageDateRange $sid
+
     $payload = $null
     $rawRows = @()
     $lastErr = $null
     $pagesDone = 0
     $seenIds = @{}
+    # 方案2：只收昨天的单；越过昨天（出现前天及更早）即停翻页。
+    $reachedBeforeYesterday = $false
+    $ukTodayDate = Get-UKNow
+    $yestDate = $ukTodayDate.Date.AddDays(-1)
+    if ($ordersOnlyYesterday) {
+      Write-Step ("  onlyYesterday=ON: keep orders dated {0} (UK), stop paging once older seen" -f $yestDate.ToString('yyyy-MM-dd'))
+    }
 
     for ($attempt = 1; $attempt -le $retries; $attempt++) {
       Write-Step ("  scrape attempt {0}/{1} (page 1)..." -f $attempt, $retries)
@@ -338,15 +567,24 @@ foreach ($store in $selected) {
       $payload = Get-ScrapePayload $execOut
       if ($payload -and $payload.ok -and $payload.rows) {
         $pageRows = @($payload.rows)
+        $kept = 0; $skippedToday = 0; $skippedOld = 0
         foreach ($r in $pageRows) {
           $oid = ''
           if ($r.orderId) { $oid = [string]$r.orderId } elseif ($r.order_id) { $oid = [string]$r.order_id }
           if (-not $oid -or $seenIds.ContainsKey($oid)) { continue }
           $seenIds[$oid] = $true
-          $rawRows += $r
+          if (-not $ordersOnlyYesterday) { $rawRows += $r; $kept++; continue }
+          $ct = if ($r.createTime) { [string]$r.createTime } else { '' }
+          $j = Test-OrderDateRange -CreateTime $ct -UKToday $ukTodayDate
+          if ($j.beforeYesterday) { $reachedBeforeYesterday = $true; $skippedOld++; continue }
+          if (-not $j.keep) { $skippedToday++; continue }   # 今天或未来日（截止日漏过），跳过不收
+          $rawRows += $r; $kept++
         }
-        if ($rawRows.Count -gt 0) { $lastErr = $null; $pagesDone = 1; break }
-        $lastErr = '0 order rows'
+        if ($ordersOnlyYesterday) {
+          Write-Step ("  page 1 rows={0} keptYesterday={1} skipToday={2} skipOlder={3}" -f $pageRows.Count, $kept, $skippedToday, $skippedOld)
+        }
+        # page 1 只要 scrape 到 rows 就算成功（即便 onlyYesterday 过滤后为 0，也要继续翻页找昨天的单）
+        $lastErr = $null; $pagesDone = 1; break
       } else {
         $lastErr = if ($payload -and $payload.error) { [string]$payload.error } else { 'scrape failed' }
         Write-Step ("  attempt fail: {0}" -f $lastErr)
@@ -354,16 +592,23 @@ foreach ($store in $selected) {
       if ($attempt -lt $retries) {
         Start-Sleep -Seconds 8
         $null = Invoke-Ziniao @('page', 'visit', '--store-id', $sid, '--url', $orderUrl, '--wait-until', 'networkidle', '--timeout', '90000')
+        $null = Invoke-SetPageDateRange $sid
         Start-Sleep -Seconds 10
       }
     }
-    if ($lastErr -or $rawRows.Count -eq 0) { throw $(if ($lastErr) { $lastErr } else { '0 rows' }) }
+    # onlyYesterday 模式下 page1 过滤后 0 条不报错（今天可能还没昨天的新单出现在第1页）；scrape 完全失败才 throw
+    if ($lastErr) { throw $lastErr }
+    if ((-not $ordersOnlyYesterday) -and $rawRows.Count -eq 0) { throw '0 rows' }
 
     Write-Step ("  page 1 rows={0} (unique total={1})" -f $pagesDone, $rawRows.Count)
 
-    # 翻页：点击下一页 → 等待 → 再 scrape，按 orderId 去重
+    # 翻页：点击下一页 → 等待 → 再 scrape，按 orderId 去重；onlyYesterday 时越过昨天即停
     if ($orderMaxPages -gt 1 -and $clickNextOneLine) {
       for ($page = 2; $page -le $orderMaxPages; $page++) {
+        if ($ordersOnlyYesterday -and $reachedBeforeYesterday) {
+          Write-Step ("  stop paging at page {0}: reached orders older than yesterday" -f $page)
+          break
+        }
         Write-Step ("  click next for page {0}..." -f $page)
         $nextOut = Invoke-Ziniao @('page', 'exec', '--store-id', $sid, '--script', $clickNextOneLine, '--timeout', '30000')
         $nextPayload = Get-ScrapePayload $nextOut
@@ -389,19 +634,27 @@ foreach ($store in $selected) {
           Write-Step ("  page {0} scrape empty/fail — stop paging" -f $page)
           break
         }
-        $added = 0
+        $added = 0; $skippedToday = 0; $skippedOld = 0
         foreach ($r in @($pagePayload.rows)) {
           $oid = ''
           if ($r.orderId) { $oid = [string]$r.orderId } elseif ($r.order_id) { $oid = [string]$r.order_id }
           if (-not $oid -or $seenIds.ContainsKey($oid)) { continue }
           $seenIds[$oid] = $true
-          $rawRows += $r
-          $added++
+          if (-not $ordersOnlyYesterday) { $rawRows += $r; $added++; continue }
+          $ct = if ($r.createTime) { [string]$r.createTime } else { '' }
+          $j = Test-OrderDateRange -CreateTime $ct -UKToday $ukTodayDate
+          if ($j.beforeYesterday) { $reachedBeforeYesterday = $true; $skippedOld++; continue }
+          if (-not $j.keep) { $skippedToday++; continue }
+          $rawRows += $r; $added++
         }
         $pagesDone++
         $payload = $pagePayload
-        Write-Step ("  page {0} new={1} unique total={2}" -f $page, $added, $rawRows.Count)
-        if ($added -eq 0) {
+        if ($ordersOnlyYesterday) {
+          Write-Step ("  page {0} keptYesterday={1} skipToday={2} skipOlder={3} unique total={4}" -f $page, $added, $skippedToday, $skippedOld, $rawRows.Count)
+        } else {
+          Write-Step ("  page {0} new={1} unique total={2}" -f $page, $added, $rawRows.Count)
+        }
+        if ($added -eq 0 -and (-not $ordersOnlyYesterday)) {
           Write-Step '  no new order ids — stop paging'
           break
         }

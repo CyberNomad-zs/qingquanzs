@@ -1,4 +1,4 @@
-# Daily content + product-card wrapper (Windows Task Scheduler)
+﻿# Daily content + product-card wrapper (Windows Task Scheduler)
 # 经营计划 P2：视频行级 video_list + 商品卡 product_traffic → 清泉 Ingest
 # 强制 SkipIngest=false（POC 默认 SkipIngest，日更必须上报）
 # 默认不写飞书；飞书 T6 走仓库根 post-collect / feishu-tk-daily-sync -ContentOnly

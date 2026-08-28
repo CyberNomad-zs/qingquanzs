@@ -1,6 +1,10 @@
-# Install / update Windows Scheduled Task: daily content + product-card (P2)
+﻿# Install / update Windows Scheduled Task: daily content + product-card (P2)
+# 2026-08-21 起【已废弃】：内容任务并入整站 wrapper run-shop-modules-daily.ps1 串行跑
+#（08:10 起整站→订单→商品→内容→联盟）。本安装脚本不再创建独立任务；保留仅供回滚/调试单跑。
+# 回滚方式：powershell -File .\scripts\install-content-daily-task.ps1 -Time "20:40"
+#
 # Run on the Ziniao Windows collector PC. Optional — only after business approval.
-# Default 20:40 — after products 20:20, before post-collect 21:00.
+# Default 20:40 — 历史夜间时间（回滚用）。现在生产走整站 wrapper 串行。
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-content-daily-task.ps1

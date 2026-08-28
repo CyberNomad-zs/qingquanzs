@@ -52,6 +52,23 @@
     return null;
   }
   try {
+    var url = location.href || '';
+    var title = document.title || '';
+    // 2026-08-20：导航跑偏防护。visit /finance/bills 后可能被登录跳转或 SPA 路由带到
+    // order/detail 等页面。findNear 用「退款」等标签词在邻近节点抓数字，而订单详情页
+    // 常有「退款」+ 金额，会被误当 refundAmount 入库（ok:true 脏数据）。落错页时直接拒绝，
+    // 让上层 wrong_page 分支重新 visit（同 creator-health / reviews 模式）。
+    if (/\/order\/detail|order_no=/i.test(url)) {
+      return JSON.stringify({
+        ok: false,
+        module: 'finance_daily',
+        source: 'dom-labels',
+        url: url,
+        title: title,
+        error: 'wrong_page_not_finance: ' + url,
+        diag: { bodyLen: (document.body ? (document.body.innerText || '').length : 0) }
+      });
+    }
     var settled = findNear(['已结算', '结算金额', 'Settled', 'Settlement', 'Payable', '可结算']);
     var pending = findNear(['待结算', '处理中', 'Pending', 'In process', '未结算']);
     var refund = findNear(['退款', 'Refund', '退货金额']);
@@ -61,8 +78,8 @@
       ok: ok,
       module: 'finance_daily',
       source: 'dom-labels',
-      url: location.href || '',
-      title: document.title || '',
+      url: url,
+      title: title,
       currency: bodyCur || 'GBP',
       settlementAmount: settled ? settled.value : null,
       pendingAmount: pending ? pending.value : null,
@@ -72,7 +89,7 @@
         pending: pending && pending.label,
         refund: refund && refund.label
       },
-      error: ok ? null : 'no finance metrics found. url=' + (location.href || '')
+      error: ok ? null : 'no finance metrics found. url=' + url
     });
   } catch (e) {
     return JSON.stringify({

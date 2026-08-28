@@ -1,8 +1,11 @@
 ﻿# Install Windows Scheduled Task: daily orders (full-store main config)
-# Default 20:00 — after shop-modules 19:45 (night chain).
+# 2026-08-21 起【已废弃】：订单任务并入整站 wrapper run-shop-modules-daily.ps1 串行跑
+#（08:10 起先整站后订单）。本安装脚本不再创建独立任务；保留仅供回滚/调试单跑订单。
+# 回滚方式：powershell -File .\scripts\install-orders-daily-task.ps1 -Time "20:00"
+#
+# Default 20:00 — 历史夜间时间（回滚用）。现在生产走整站 wrapper 串行。
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File .\scripts\install-orders-daily-task.ps1
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-orders-daily-task.ps1 -Time "20:00"
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-orders-daily-task.ps1 -Uninstall
 

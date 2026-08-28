@@ -13,25 +13,19 @@ echo ============================================================
 echo.
 echo   ---- 广告日报 (17:20) ----
 echo   [1] 预览广告店铺列表   (ListOnly)
-echo   [2] 广告干跑           (不写飞书)
-echo   [3] 立即跑广告日报     (同 17:20 任务)
-echo   [4] 安装广告 17:20 任务
+echo   [2] 立即跑广告日报     (同 17:20 任务)
+echo   [3] 安装广告 17:20 任务
 echo.
-echo   ---- 夜间整站 · 立即跑 (需紫鸟) ----
+echo   ---- 早上整站 08:10 · 立即跑 (需紫鸟) ----
 echo   [A] 店 KPI/健康/财务
 echo   [B] 订单
 echo   [C] 商品
 echo   [D] 内容+商品卡
 echo   [E] 联盟达人
-echo   [F] 合并链 full-site (shop→orders→products)
-echo.
-echo   ---- 中心尾巴 (不抢紫鸟) ----
-echo   [P] 规则+飞书 post-collect
-echo   [S] 飞书仅同步
+echo   [H] 事件型补采(循环 全天常驻)
 echo.
 echo   ---- 安装计划任务 ----
-echo   [N] 安装夜间拆分任务包 (19:45-20:55)
-echo   [T] 安装 21:00 规则飞书任务
+echo   [N] 安装早上整站 08:10 (串行5段)
 echo.
 echo   ---- 其它 ----
 echo   [L] 打开日志目录
@@ -44,19 +38,15 @@ echo.
 set /p choice=请选择:
 
 if "%choice%"=="1" goto ads_list
-if "%choice%"=="2" goto ads_dry
-if "%choice%"=="3" goto ads_daily
-if "%choice%"=="4" goto ads_install
+if "%choice%"=="2" goto ads_daily
+if "%choice%"=="3" goto ads_install
 if /I "%choice%"=="A" goto shop
 if /I "%choice%"=="B" goto orders
 if /I "%choice%"=="C" goto products
 if /I "%choice%"=="D" goto content
 if /I "%choice%"=="E" goto affiliate
-if /I "%choice%"=="F" goto fullsite
-if /I "%choice%"=="P" goto post
-if /I "%choice%"=="S" goto feishu
+if /I "%choice%"=="H" goto daytime
 if /I "%choice%"=="N" goto night_install
-if /I "%choice%"=="T" goto post_install
 if /I "%choice%"=="L" goto logs
 if /I "%choice%"=="O" goto config
 if /I "%choice%"=="R" goto reports
@@ -69,12 +59,6 @@ goto menu
 
 :ads_list
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-multi-store.ps1" -ListOnly
-goto pause
-
-:ads_dry
-echo 广告干跑（不写飞书）。需紫鸟已登录。
-pause
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-multi-store.ps1" -DryRun true
 goto pause
 
 :ads_daily
@@ -117,36 +101,16 @@ pause
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-affiliate-daily.ps1"
 goto pause
 
-:fullsite
-echo 合并链 shop→orders→products
-pause
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-full-site-daily.ps1"
-goto pause
-
-:post
-echo 规则+飞书（仓库根脚本，需 PG+飞书）
-pause
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\..\scripts\tk-p0-post-collect.ps1" -LookbackDays 14
-goto pause
-
-:feishu
-echo 飞书仅同步
-pause
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\..\scripts\feishu-tk-daily-sync.ps1" -LookbackDays 14
-goto pause
-
 :night_install
-echo 安装夜间拆分：19:45 shop / 20:00 orders / 20:20 products / 20:40 content / 20:55 affiliate
+echo 安装早上整站 08:10（串行5段：shop->orders->products->content->affiliate）
 pause
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-shop-modules-daily-task.ps1" -Time "19:45"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-orders-daily-task.ps1" -Time "20:00"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-products-daily-task.ps1" -Time "20:20"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-content-daily-task.ps1" -Time "20:40"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-affiliate-daily-task.ps1" -Time "20:55"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install-shop-modules-daily-task.ps1" -Time "08:10"
 goto pause
 
-:post_install
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\..\scripts\install-tk-p0-post-collect-daily-task.ps1" -Time "21:00"
+:daytime
+echo 事件型补采循环：每30分钟跑违规/差评/达人健康，全天常驻避开 08:00~11:30 + 17:00~21:30
+pause
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-shop-modules-daytime-loop.ps1" -IntervalSec 1800
 goto pause
 
 :logs

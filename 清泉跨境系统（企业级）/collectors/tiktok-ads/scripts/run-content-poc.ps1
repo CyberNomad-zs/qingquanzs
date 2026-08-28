@@ -459,7 +459,16 @@ foreach ($store in $selected) {
           Write-Step ("  attempt fail: {0}" -f $lastErr)
           if ($attempt -lt $retries) {
             Start-Sleep -Seconds 12
-            if ($lastErr -match 'about:blank|bridge') {
+            # 2026-08-21：导航跑偏防护（对齐 run-shop-modules.ps1 的 creator_health 模式）。
+            # scrape-product-traffic-page.js 对落错页（order/detail、compass/shop-tab 商城概览）
+            # 返回 wrong_page_not_product_traffic；此类错误光等 SPA 无用，必须重新 visit 目标 URL
+            # 把页面拉回 product-card-analytics，并比普通重试多等 SPA 渲染。否则会在错页正文里
+            # “凑”出假 KPI（订单号被误抓成 orders、概览卡 customers=16）静默入库空数据。
+            if ($lastErr -match 'wrong_page') {
+              Write-Step '  wrong page — re-visit target URL + extra SPA wait'
+              $null = Invoke-Ziniao @('page', 'visit', '--store-id', $sid, '--url', $modUrl, '--wait-until', 'load', '--timeout', '120000')
+              Start-Sleep -Seconds 25
+            } elseif ($lastErr -match 'about:blank|bridge') {
               Write-Step '  re-gate page after blank/bridge'
               $null = Invoke-EnsurePageReady -StoreId $sid -TargetUrl $modUrl -UrlCheckOneLiner $urlCheckOneLiner -MaxTries 2
               Start-Sleep -Seconds 20

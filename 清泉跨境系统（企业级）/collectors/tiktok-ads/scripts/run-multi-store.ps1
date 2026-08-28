@@ -13,7 +13,11 @@ param(
   [switch]$ListOnly,
   # string so -File callers work (Nullable[bool] cannot bind "$true"/"$false" from -File)
   # omit / empty => use config.options.dryRun; true|1|yes / false|0|no
-  [string]$DryRun = ""
+  [string]$DryRun = "",
+  # today | yesterday | yyyy-MM-dd（点日历补历史日）。
+  # 不要叫 DateMode：PS 参数大小写不敏感，会和脚本里的 $dateMode 撞名，
+  # `$dateMode = 'yesterday'` 会把传入值盖掉。
+  [string]$PageDate = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,6 +115,7 @@ trap {
 }
 
 function Get-BizDate([string]$mode) {
+  if ($mode -match '^\d{4}-\d{2}-\d{2}$') { return $mode }
   $d = Get-Date
   if ($mode -eq 'yesterday') { $d = $d.AddDays(-1) }
   return $d.ToString('yyyy-MM-dd')
@@ -799,16 +804,18 @@ function Convert-DryRunFlag([string]$raw) {
 }
 $dryRunParsed = Convert-DryRunFlag $DryRun
 $useDryRun = if ($null -ne $dryRunParsed) { [bool]$dryRunParsed } else { [bool]$cfg.options.dryRun }
-$bizDate = Get-BizDate $cfg.options.dateMode
+$pageDateArg = $PageDate
 $dateMode = 'yesterday'
-if ($cfg.options -and $cfg.options.dateMode) {
+if (-not [string]::IsNullOrWhiteSpace($pageDateArg)) {
+  $dateMode = $pageDateArg.Trim().ToLowerInvariant()
+} elseif ($cfg.options -and $cfg.options.dateMode) {
   $dateMode = ([string]$cfg.options.dateMode).Trim().ToLowerInvariant()
 }
-if ($dateMode -ne 'today' -and $dateMode -ne 'yesterday') {
-  # custom 仅影响业务日期标签；页面区间仍切到昨天，避免抓近 7 天
-  Write-Step ("dateMode={0} is not today/yesterday; page date range will use yesterday" -f $dateMode)
+if ($dateMode -ne 'today' -and $dateMode -ne 'yesterday' -and $dateMode -notmatch '^\d{4}-\d{2}-\d{2}$') {
+  Write-Step ("dateMode={0} is not today/yesterday/yyyy-MM-dd; page date range will use yesterday" -f $dateMode)
   $dateMode = 'yesterday'
 }
+$bizDate = Get-BizDate $dateMode
 $currencyCfg = Get-CurrencyConfig $cfg
 $scrapeRetries = 3
 $scrapeRetryWaitMs = 15000
@@ -970,6 +977,8 @@ foreach ($store in $selected) {
   $execOut = $null
   $payload = $null
   $debugSaved = $false
+  $ingestFailed = $false
+  $ingestErr = $null
   try {
     Write-Step "  open store..."
     # 默认尽量拉大窗口：--window-ratio full + Win32 最大化 + page resize（ziniao-window.ps1）
@@ -1195,7 +1204,10 @@ foreach ($store in $selected) {
     $item.rows = $rows.Count
     if ($rows.Count -gt 0) { $allCampaignRows += $rows }
 
-    # --- Stage A: 旁路上报清泉中心（failOpen，默认不阻断飞书）---
+    # --- Stage A: 旁路上报清泉中心 ---
+    # 2026-08-20：ingest 失败不再静默吞掉。底层 Send-QingquanIngest 仍 failOpen（不抛异常、
+    # 不阻断下方飞书写入），但此处检查 ok/failed：失败则该店标 not-ok + 记 error，
+    # 使 summary 醒目、整批 exit 2（任务计划程序判定夜间任务失败，便于发现丢店）。
     $writeMode = 'direct'
     if (Get-Command Get-FeishuWriteMode -ErrorAction SilentlyContinue) {
       $writeMode = Get-FeishuWriteMode $cfg
@@ -1203,6 +1215,7 @@ foreach ($store in $selected) {
     $qingquanEnabled = $false
     if ($cfg.qingquan -and $null -ne $cfg.qingquan.enabled) { $qingquanEnabled = [bool]$cfg.qingquan.enabled }
 
+    $ingestFailed = $false
     if ($qingquanEnabled -and (Get-Command Send-QingquanIngest -ErrorAction SilentlyContinue)) {
       if ($useDryRun) {
         Write-Step ("  qingquan dryRun: would report {0} rows (writeMode={1}, currency={2})" -f $rows.Count, $writeMode, $targetCurrency)
@@ -1215,10 +1228,17 @@ foreach ($store in $selected) {
         $item.qingquanDup = $qq.duplicated
         if ($qq.error) { $item.qingquanError = [string]$qq.error }
         Write-Step ("  qingquan accepted={0} duplicated={1} failed={2} ok={3}" -f $qq.accepted, $qq.duplicated, $qq.failed, $qq.ok)
+        # 关键：ingest 失败（curl 超时/网络/401）不能再当成功。failed>0 或 ok=false 即视为丢店。
+        if (-not $qq.ok -or ([int]$qq.failed -gt 0)) {
+          $ingestFailed = $true
+          $ingestErr = if ($qq.error) { [string]$qq.error } else { ("ingest failed={0} accepted={1} (rows={2})" -f $qq.failed, $qq.accepted, $rows.Count) }
+          Write-Step ("  INGEST FAIL: {0} — 该店数据未进 PG，标 not-ok + exit 2" -f $ingestErr)
+        }
       }
     }
 
     # direct / dual → 写飞书；center → 仅中心（飞书由中心同步）
+    # 飞书写入是独立路径，不被 ingest 失败拖累——即使 ingest 丢店，飞书日报仍写（便于回填对照）。
     $shouldWriteFeishu = ($writeMode -ne 'center')
     if ($shouldWriteFeishu) {
       Write-Step ("  scraped {0} rows (source={1}), write Feishu..." -f $rows.Count, $payload.source)
@@ -1229,7 +1249,13 @@ foreach ($store in $selected) {
       Write-Step ("  scraped {0} rows (source={1}), skip Feishu direct write (writeMode=center)" -f $rows.Count, $payload.source)
       $item.written = 0
     }
-    $item.ok = $true
+    # ok 仅当飞书/ingest 都成功；ingest 失败（丢店）即使飞书写了也标 not-ok，触发 exit 2
+    if ($ingestFailed) {
+      $item.ok = $false
+      $item.error = $ingestErr
+    } else {
+      $item.ok = $true
+    }
     $null = Save-ScrapeDebug -StoreId $sid -StoreName $sname -DisplayName $display -AdsUrl $adsUrl `
       -ExecOut $execOut -Payload $payload -ErrorMsg $null -AsLast
     $debugSaved = $true
@@ -1264,7 +1290,11 @@ $okCount = @($summary | Where-Object { $_.ok }).Count
 Write-Step ("OK {0} / {1}" -f $okCount, $summary.Count)
 $qqFail = @($summary | Where-Object { $_.qingquanError }).Count
 if ($qqFail -gt 0) {
-  Write-Step ("NOTE: qingquan report soft-failed on {0} store(s) (failOpen; Feishu path unaffected if writeMode!=center)" -f $qqFail)
+  # 2026-08-20：ingest 失败现已标 not-ok（不再 failOpen 静默）。列出丢店，便于定位回填。
+  Write-Step ("INGEST FAIL on {0} store(s) — 数据未进 PG，需从飞书日报回填:" -f $qqFail)
+  foreach ($s in @($summary | Where-Object { $_.qingquanError })) {
+    Write-Step ("  - {0}: {1}" -f $s.displayName, $s.qingquanError)
+  }
 }
 $outPath = Join-Path $script:logsDir ("multi-store-{0}.json" -f $script:runStamp)
 New-Item -ItemType Directory -Force -Path $script:logsDir | Out-Null

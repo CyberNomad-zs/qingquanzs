@@ -1213,16 +1213,20 @@ function ConvertTo-QingquanCreatorHealthIngestItems {
     }
   }
 
-  # multi-account switch: violations keyed by creator name
-  if ($p.multiCreatorViolations) {
-    try {
-      foreach ($prop in $p.multiCreatorViolations.PSObject.Properties) {
-        Add-CreatorViolItems -Owner ([string]$prop.Name) -ViolList $prop.Value
+  # multi-account switch: violations keyed by creator name.
+  # PowerShell 侧补进去的是 Hashtable；若经 ConvertTo-Json 再读回来则是 PSCustomObject。
+  # 必须先走 IDictionary，否则 Hashtable.PSObject.Properties 会把 Count/Keys/Values 当达人名。
+  $mcv = $null
+  if ($p.PSObject.Properties.Name -contains 'multiCreatorViolations') { $mcv = $p.multiCreatorViolations }
+  if ($mcv) {
+    if ($mcv -is [System.Collections.IDictionary]) {
+      foreach ($k in @($mcv.Keys)) {
+        Add-CreatorViolItems -Owner ([string]$k) -ViolList $mcv[$k]
       }
-    } catch {
-      # hashtable path
-      foreach ($k in @($p.multiCreatorViolations.Keys)) {
-        Add-CreatorViolItems -Owner ([string]$k) -ViolList $p.multiCreatorViolations[$k]
+    } else {
+      foreach ($prop in $mcv.PSObject.Properties) {
+        if ($prop.MemberType -ne 'NoteProperty') { continue }
+        Add-CreatorViolItems -Owner ([string]$prop.Name) -ViolList $prop.Value
       }
     }
   } else {
@@ -1480,13 +1484,37 @@ function Send-QingquanIngest {
 
   $totAccepted = 0; $totDup = 0; $totFailed = 0; $lastErr = $null; $anyOk = $false
   $idx = 0
+  # 2026-08-20：curl schannel 在大 POST + 连续请求下偶发 (56) server closed abruptly，
+  # curl 自带 --retry 对 mid-transfer 错误覆盖不全。此处加 PS 层重试：传输类失败间隔重发。
+  $maxAttempts = 3
   foreach ($chunk in $chunks) {
     $idx++
     $n = @($chunk).Count
     if ($chunks.Count -gt 1 -and -not $Quiet) {
       Write-Host ("  qingquan batch {0}/{1} items={2}" -f $idx, $chunks.Count, $n)
     }
-    $one = Send-QingquanIngestBatch -Config $Config -Items $chunk -Source $Source -Quiet:$Quiet -TimeoutSecOverride $(if ($n -gt 40) { 90 } else { 0 })
+    $one = $null
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+      $one = Send-QingquanIngestBatch -Config $Config -Items $chunk -Source $Source -Quiet:$Quiet -TimeoutSecOverride $(if ($n -gt 40) { 90 } else { 0 })
+      if ($one.ok) { break }
+      # 仅对传输/网络类错误重试（schannel 56、timeout、connect-failed、empty response）；
+      # 4xx 业务错误（apiKey/字段）重试无意义，直接跳出。
+      $isTransport = $false
+      if ($one.error) {
+        $e = [string]$one.error
+        if ($e -match 'schannel|closed abruptly|missing close_notify|connect|timeout|timed out|empty|network|Failed to receive|curl failed|HTTP 5\d\d') {
+          $isTransport = $true
+        }
+      }
+      if (-not $isTransport) { break }
+      if ($attempt -lt $maxAttempts) {
+        $backoff = 5 + ($attempt - 1) * 5   # 5s, 10s
+        if (-not $Quiet) {
+          Write-Host ("  qingquan batch {0} 传输失败(attempt {1}/{2})，{3}s 后重试：{4}" -f $idx, $attempt, $maxAttempts, $backoff, $one.error)
+        }
+        Start-Sleep -Seconds $backoff
+      }
+    }
     if ($one.ok) { $anyOk = $true }
     $totAccepted += [int]$one.accepted
     $totDup += [int]$one.duplicated

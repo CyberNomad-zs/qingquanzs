@@ -1,4 +1,4 @@
-# Daily affiliate / creator performance wrapper (Windows Task Scheduler)
+﻿# Daily affiliate / creator performance wrapper (Windows Task Scheduler)
 # 经营计划 P3：联盟中心·表现 → tiktok_affiliate_daily + tiktok_affiliate_creator
 # 强制 SkipIngest=false（POC 默认 SkipIngest，日更必须上报）
 # 默认模块：enter_center + performance（跳过 probe，减一轮打开）

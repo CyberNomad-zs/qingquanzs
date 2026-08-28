@@ -312,6 +312,7 @@ function Invoke-CreatorHealthMultiAccountScrape {
     Write-Step '  creator multi-account: switch template missing, keep list-only scrape'
     return $BasePayload
   }
+  $junkName = '切换账号|ScoreHub|违规次数|官方账号|营销账号|了解更多|需要关注|你的店铺已绑定|店铺已绑定|Switch\s*account'
   $names = New-Object System.Collections.Generic.List[string]
   if ($BasePayload.accounts) {
     foreach ($a in @($BasePayload.accounts)) {
@@ -319,11 +320,13 @@ function Invoke-CreatorHealthMultiAccountScrape {
       if ($a.name) { $n = [string]$a.name }
       elseif ($a.creator_name) { $n = [string]$a.creator_name }
       $n = $n.Trim()
-      if ($n -and -not $names.Contains($n)) { [void]$names.Add($n) }
+      if (-not $n -or $n -match $junkName) { continue }
+      if (-not $names.Contains($n)) { [void]$names.Add($n) }
     }
   }
   if ($names.Count -eq 0 -and $BasePayload.selectedName) {
-    [void]$names.Add([string]$BasePayload.selectedName)
+    $sel = ([string]$BasePayload.selectedName).Trim()
+    if ($sel -and $sel -notmatch $junkName) { [void]$names.Add($sel) }
   }
   if ($names.Count -eq 0) {
     Write-Step '  creator multi-account: no account names in list'
@@ -402,10 +405,11 @@ function Invoke-CreatorHealthMultiAccountScrape {
   }
 
   # rebuild payload for converter
+  # ConvertFrom-Json 对象默认不能直接加新属性（ErrorActionPreference=Stop 会炸成
+  # 「在此对象上找不到属性 multiCreatorViolations」）。accounts 字段 JSON 里已有可直接赋；
+  # multiCreatorViolations 是切号循环后补的，必须 Add-Member。
   $BasePayload.accounts = @($mergedAccounts.ToArray())
-  # flatten violations with creator ownership for converter (violations per current selected was old shape)
-  # converter uses selectedName for violations — instead put multi into scrape_raw and enhance converter
-  $BasePayload.multiCreatorViolations = $allViolByCreator
+  $BasePayload | Add-Member -NotePropertyName 'multiCreatorViolations' -NotePropertyValue $allViolByCreator -Force
   $scored = @($mergedAccounts | Where-Object { $null -ne $_.healthScore }).Count
   Write-Step ("  creator multi-account done: {0}/{1} with healthScore" -f $scored, $mergedAccounts.Count)
   return $BasePayload
@@ -432,6 +436,7 @@ foreach ($store in $selected) {
         storeId = $sid; storeName = $sname; displayName = $display; module = $mod
         ok = $false; qingquanAccepted = 0; qingquanDup = 0; error = $null
       }
+      $ingestFailed = $false
       $modUrl = Get-ModuleUrl $store $cfg $mod
       Write-Step ("  -- module {0} url={1}" -f $mod, $modUrl)
       try {
@@ -464,8 +469,15 @@ foreach ($store in $selected) {
           Write-Step ("  attempt fail: {0}" -f $lastErr)
           if ($attempt -lt $retries) {
             Start-Sleep -Seconds 12
-            # 不重复 visit（可能打挂 Bridge）；再等 SPA
-            if ($lastErr -match 'SPA not ready|not ready|no KPI|no health|no violation|no review|no experience|no creator') {
+            # 2026-08-20：导航跑偏防护。scrape 脚本对落错页（如 creator-health 落到 order/detail）
+            # 返回 wrong_page_not_*；此类错误光等 SPA 无用，必须重新 visit 目标 URL 把页面拉回来，
+            # 并比普通重试多等 SPA 渲染。否则会在订单详情页正文里"凑"出假健康分等脏数据入库。
+            if ($lastErr -match 'wrong_page') {
+              Write-Step '  wrong page — re-visit target URL + extra SPA wait'
+              $null = Invoke-Ziniao @('page', 'visit', '--store-id', $sid, '--url', $modUrl, '--wait-until', 'load', '--timeout', '120000')
+              Start-Sleep -Seconds 25
+            } elseif ($lastErr -match 'SPA not ready|not ready|no KPI|no health|no violation|no review|no experience|no creator') {
+              # 不重复 visit（可能打挂 Bridge）；再等 SPA
               Write-Step '  extra 25s for SPA render'
               Start-Sleep -Seconds 25
             } else {
@@ -507,6 +519,8 @@ foreach ($store in $selected) {
         (@{ storeId = $sid; displayName = $display; url = $modUrl; bizDate = $bizDate; payload = $payload } |
           ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $dbg -Encoding UTF8
 
+        # 2026-08-20：ingest 失败不再静默吞掉。底层 Send-QingquanIngest 仍 failOpen（不抛异常），
+        # 此处检查 ok/failed：失败则 $ingestFailed=$true，使该店该模块标 not-ok + 整批 exit 2。
         if ((Get-Command Send-QingquanIngest -ErrorAction SilentlyContinue) -and $cfg.qingquan -and $cfg.qingquan.enabled) {
           $collectedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss+00:00')
           $qqItems = $null
@@ -555,21 +569,33 @@ foreach ($store in $selected) {
                 $qq = Send-QingquanIngest -Config $cfg -Items $batch -Source $srcKey
                 $item.qingquanAccepted = [int]$item.qingquanAccepted + [int]$qq.accepted
                 $item.qingquanDup = [int]$item.qingquanDup + [int]$qq.duplicated
-                if ($qq.error) { $item.error = [string]$qq.error }
+                if (-not $qq.ok -or ([int]$qq.failed -gt 0)) {
+                  $ingestFailed = $true
+                  $item.error = if ($qq.error) { [string]$qq.error } else { ("ingest {0} failed={1}" -f $srcKey, $qq.failed) }
+                  Write-Step ("  INGEST FAIL {0}: {1} — 标 not-ok + exit 2" -f $srcKey, $item.error)
+                } elseif ($qq.error -and -not $item.error) {
+                  $item.error = [string]$qq.error
+                }
                 Write-Step ("  qingquan {0} accepted={1} dup={2} ok={3}" -f $srcKey, $qq.accepted, $qq.duplicated, $qq.ok)
               }
             } else {
               $qq = Send-QingquanIngest -Config $cfg -Items $qqItems -Source $sourceMap[$mod]
               $item.qingquanAccepted = $qq.accepted
               $item.qingquanDup = $qq.duplicated
-              if ($qq.error) { $item.error = [string]$qq.error }
+              if (-not $qq.ok -or ([int]$qq.failed -gt 0)) {
+                $ingestFailed = $true
+                $item.error = if ($qq.error) { [string]$qq.error } else { ("ingest {0} failed={1} (items={2})" -f $sourceMap[$mod], $qq.failed, $qqCount) }
+                Write-Step ("  INGEST FAIL {0}: {1} — 标 not-ok + exit 2" -f $sourceMap[$mod], $item.error)
+              } elseif ($qq.error) {
+                $item.error = [string]$qq.error
+              }
               Write-Step ("  qingquan accepted={0} dup={1} ok={2}" -f $qq.accepted, $qq.duplicated, $qq.ok)
             }
           }
         } else {
           Write-Step '  skip qingquan'
         }
-        $item.ok = $true
+        if (-not $ingestFailed) { $item.ok = $true }
       } catch {
         $item.error = [string]$_
         Write-Step ("  FAIL {0}: {1}" -f $mod, $item.error)
@@ -592,7 +618,16 @@ Write-Step '======== SHOP-MODULES SUMMARY ========'
 $summary | Format-Table storeName, module, ok, qingquanAccepted, qingquanDup, error -AutoSize
 $okN = @($summary | Where-Object { $_.ok }).Count
 Write-Step ("OK {0}/{1}" -f $okN, $summary.Count)
+$failN = @($summary | Where-Object { -not $_.ok }).Count
+if ($failN -gt 0) {
+  # 2026-08-20：ingest/刮取失败的店模块在此列出，便于定位回填。
+  Write-Step ("FAIL on {0} module(s):" -f $failN)
+  foreach ($s in @($summary | Where-Object { -not $_.ok })) {
+    Write-Step ("  - {0} / {1}: {2}" -f $s.displayName, $s.module, $s.error)
+  }
+}
 $sumPath = Join-Path $script:logsDir ("shop-modules-summary-{0}.json" -f $script:runStamp)
 ($summary | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $sumPath -Encoding UTF8
 Write-Step ("summary: {0}" -f $sumPath)
 Write-Step '===== shop-modules multi-store END ====='
+if ($okN -lt $summary.Count) { exit 2 }

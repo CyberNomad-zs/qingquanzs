@@ -1,16 +1,18 @@
-# Install / update Windows Scheduled Task: daily shop-modules (KPI/health/experience/finance/violation/reviews/creator_health)
+﻿# Install / update Windows Scheduled Task: daily shop-modules 串行5段（08:10 起全量）
 # Full-store via main config stores.config.json (same filter as ads).
 # Run on the Ziniao Windows collector PC.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-shop-modules-daily-task.ps1
-#   powershell -ExecutionPolicy Bypass -File .\scripts\install-shop-modules-daily-task.ps1 -Time "19:45"
+#   powershell -ExecutionPolicy Bypass -File .\scripts\install-shop-modules-daily-task.ps1 -Time "08:10"
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-shop-modules-daily-task.ps1 -Uninstall
 #
-# Default 19:45 - night full-site chain (+2h vs old 17:45); after ads daily 17:20.
+# Default 08:10 - 2026-08-21 从夜间挪到早上 8:10（用户要求）。wrapper run-shop-modules-daily.ps1
+# 串行跑 5 段：整站7模块→订单→商品→内容→联盟。白天 loop 避开 08:00~11:30 让出 Bridge。
+# 运营上午能看到昨天的全部数据，不用等到深夜。原 TK-Orders/Products/Content/Affiliate-Daily 夜间任务已删并入。
 
 param(
-  [string]$Time = '19:45',
+  [string]$Time = '08:10',
   [string]$TaskName = 'TK-Shop-Modules-Daily',
   [switch]$Uninstall
 )
@@ -91,6 +93,12 @@ Write-Host ("  When    : every day {0} (local time)" -f $st)
 Write-Host ("  Run     : {0}" -f $wrapper)
 Write-Host ("  Config  : {0}" -f $mainConfig)
 Write-Host "  Modules : shop_daily, health_daily, experience_daily, finance_daily, violation, reviews, creator_health -> Qingquan Ingest only"
+Write-Host "  +Orders : 串行 run-orders.ps1（方案2 只抓昨天）"
+Write-Host "  +Products : 串行 run-products.ps1（全店商品卡）"
+Write-Host "  +Content : 串行 run-content-poc.ps1（video_list+product_traffic，强制入库）"
+Write-Host "  +Affiliate : 串行 run-affiliate-poc.ps1（enter_center+performance，强制入库）"
+Write-Host "  串行5段单 Bridge 零冲突；各段失败不阻断后续。原 TK-Orders/Products/Content/Affiliate-Daily 夜间任务已删并入。"
+Write-Host "  loop避 : daytime-loop 避开 08:00~11:30 让本任务整段（见 run-shop-modules-daytime-loop.ps1）"
 Write-Host ""
 Write-Host "Prerequisites at run time:"
 Write-Host "  1) Windows user logged on (desktop session for Ziniao)"

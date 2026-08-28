@@ -1,4 +1,4 @@
-# Daily report wrapper (for Windows Task Scheduler + GUI [4])
+﻿# Daily report wrapper (for Windows Task Scheduler + GUI [4])
 # Spawns run-multi-store.ps1 in a hidden PowerShell (no second menu / no flashy window).
 # Default: real Feishu write; dateMode from config.
 #

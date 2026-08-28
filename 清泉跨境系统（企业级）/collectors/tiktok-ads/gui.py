@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TK 整站采集 · 图形启动器（广告日报 + 夜间整站 + 规则飞书）"""
+"""TK 整站采集 · 图形启动器（广告日报 17:20 + 早上整站 08:10 串行5段 + 规则飞书）"""
 
 from __future__ import annotations
 
@@ -36,18 +36,15 @@ REPORTS = ROOT / "日报"
 CONFIG = ROOT / "config" / "stores.config.json"
 # collectors/tiktok-ads → 仓库根
 REPO_ROOT = ROOT.parent.parent
-REPO_SCRIPTS = REPO_ROOT / "scripts"
 POWERSHELL = "powershell.exe"
 
-# 与 install-*-daily-task / 调度划分计划一致（广告 17:20 不动）
+# 与 install-*-daily-task / 调度划分计划一致：
+#   广告日报 17:20（下午跑，需全天数据，不动）
+#   整站+订单+商品+内容+联盟 全部并入 08:10 一个任务串行5段（2026-08-21 从夜间挪早上）
 T_AD = "17:20"
-T_SHOP = "19:45"
-T_FULL = "19:50"
-T_ORDERS = "20:00"
-T_PRODUCTS = "20:20"
-T_CONTENT = "20:40"
-T_AFFILIATE = "20:55"
-T_POST = "21:00"
+T_DAILY = "08:10"      # 整站串行5段：shop→orders→products→content→affiliate
+# 旧夜间拆分时间常量已废弃（19:45/20:00/20:20/20:40/20:55），不再使用。
+# 规则飞书(原 T_POST 21:00)属中心机功能，数据采集机不需要，已从启动器剔除。
 
 
 def _ps_file(script: Path, *extra: str) -> list[str]:
@@ -71,6 +68,10 @@ class App(Tk):
         self.minsize(700, 600)
         self.configure(bg="#0f1419")
         self._proc: Optional[subprocess.Popen] = None
+        # 事件型补采 loop 是常驻后台任务，单独占一个进程槽，不挤占 self._proc。
+        # 这样起完 loop 后仍可点前台短任务(预览/立即跑等)，停止按钮也分两个：
+        # 「停止当前任务」杀 self._proc；「停止补采循环」专门杀 self._loop_proc。
+        self._loop_proc: Optional[subprocess.Popen] = None
         self._q: queue.Queue[str] = queue.Queue()
         self._log_path: Optional[Path] = None
         self._build()
@@ -91,8 +92,8 @@ class App(Tk):
         Label(
             header,
             text=(
-                f"广告 {T_AD}  ·  夜间整站 {T_SHOP}–{T_AFFILIATE}  ·  "
-                f"规则+飞书 {T_POST}  ·  紫鸟串行 / PG 入库  ·  按钮区可滚轮下滑"
+                f"广告 {T_AD}  ·  早上整站 {T_DAILY}(串行5段)  ·  "
+                f"紫鸟串行 / PG 入库  ·  按钮区可滚轮下滑"
             ),
             font=("Microsoft YaHei UI", 10),
             fg="#cbd5e1",
@@ -192,21 +193,17 @@ class App(Tk):
         # (section_title|None, button_text, command, color)
         items: list[tuple[Optional[str], str, Callable[[], None], str]] = [
             ("广告日报（同事机常见 · 17:20）", "广告·预览店铺", self.run_ads_list, "#3b82f6"),
-            (None, "广告·干跑(不写飞书)", self.run_ads_dry, "#64748b"),
             (None, f"广告·立即日报 {T_AD}", self.run_ads_daily, "#0ea5e9"),
             (None, f"广告·安装 {T_AD} 任务", self.install_ads_task, "#8b5cf6"),
-            ("夜间整站 · 立即跑（需紫鸟）", "整站·店KPI/健康/财务", self.run_shop, "#2563eb"),
+            ("早上整站 · 立即跑（需紫鸟）", "整站·立即跑全5段", self.run_shop, "#2563eb"),
             (None, "整站·订单", self.run_orders, "#2563eb"),
             (None, "整站·商品", self.run_products, "#2563eb"),
             (None, "整站·内容+商品卡", self.run_content, "#0891b2"),
             (None, "整站·联盟达人", self.run_affiliate, "#0891b2"),
-            (None, "整站·合并链 full-site", self.run_full_site, "#0284c7"),
-            ("中心尾巴 · 不抢紫鸟", f"规则+飞书 {T_POST}", self.run_post_collect, "#16a34a"),
-            (None, "飞书·仅同步(全量)", self.run_feishu_sync, "#15803d"),
-            ("安装计划任务", "安装·夜间拆分任务包", self.install_night_split, "#a855f7"),
-            (None, f"安装·{T_POST} 规则飞书", self.install_post_task, "#9333ea"),
-            ("其它", "白天·空闲轮巡(SkipAds)", self.run_day_loop, "#d97706"),
-            (None, "打开日志目录", self.open_logs, "#475569"),
+            (None, "事件型补采(循环)", self.run_shop_daytime, "#f59e0b"),
+            (None, "停止补采循环", self.stop_loop, "#dc2626"),
+            ("安装计划任务", f"安装·早上整站 {T_DAILY}(串行5段)", self.install_night_split, "#a855f7"),
+            ("其它", "打开日志目录", self.open_logs, "#475569"),
             (None, "打开配置 / 日报", self.open_config_reports, "#475569"),
             (None, "环境自检", self.doctor_only, "#f59e0b"),
             (None, "安装环境依赖", self.install_deps, "#f59e0b"),
@@ -492,16 +489,98 @@ class App(Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _loop_busy(self) -> bool:
+        """事件型补采 loop 是否在跑（独立于 self._proc 的前台任务槽）。"""
+        return self._loop_proc is not None and self._loop_proc.poll() is None
+
+    def _run_loop(self, title: str, cmd: list[str], confirm: str) -> None:
+        """启动常驻后台任务（事件型补采 loop），用独立槽 self._loop_proc。
+
+        与 _run 的区别：不占 self._proc、不受 _busy() 拦截（起完 loop 仍可点前台短任务）、
+        用 _loop_busy() 防重复起 loop。loop 一直跑，worker 线程持续读 stdout 直到被
+        stop_loop() 杀掉或关窗口。
+        """
+        if self._loop_busy():
+            messagebox.showwarning("进行中", "补采循环已在运行，请先「停止补采循环」。")
+            return
+        if not messagebox.askyesno("确认", confirm):
+            return
+        if "-File" in cmd:
+            idx = cmd.index("-File") + 1
+            if idx < len(cmd) and not Path(cmd[idx]).exists():
+                messagebox.showerror("错误", f"脚本不存在:\n{cmd[idx]}")
+                return
+
+        workdir = ROOT
+        log_path = self._new_run_log_path(title)
+        self._append("")
+        self._append(f"======== {datetime.now():%H:%M:%S} {title} ========")
+        self._append(" ".join(cmd))
+        self._append(f"[log] {log_path}")
+        self._set_status(f"后台运行：{title} · 日志 {log_path.name}")
+
+        def worker() -> None:
+            collected: list[str] = []
+            try:
+                with open(log_path, "w", encoding="utf-8", newline="\n") as fp:
+
+                    def emit(s: str) -> None:
+                        collected.append(s)
+                        self._q.put(s)
+                        try:
+                            fp.write(s + "\n")
+                            fp.flush()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    creation = 0
+                    if sys.platform == "win32":
+                        creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    self._loop_proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(workdir),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        creationflags=creation,
+                    )
+                    assert self._loop_proc.stdout is not None
+                    for line in self._loop_proc.stdout:
+                        emit(line.rstrip("\r\n"))
+                    code = self._loop_proc.wait()
+                    emit(f"--- 补采循环结束 exit={code} ---")
+                    emit(f"[log] saved: {log_path}")
+                    self.after(
+                        0,
+                        lambda c=code: self._set_status(
+                            f"补采循环已结束 exit={c} · 日志 {log_path.name}"
+                        ),
+                    )
+            except Exception as e:  # noqa: BLE001
+                self._q.put(f"ERROR: {e}")
+                self.after(0, lambda: self._set_status(f"补采循环失败：{e}"))
+            finally:
+                self._loop_proc = None
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def stop_loop(self) -> None:
+        """专门停止事件型补采 loop（self._loop_proc），不影响前台 self._proc。"""
+        if not self._loop_busy():
+            messagebox.showinfo("停止", "补采循环未在运行。")
+            return
+        try:
+            self._kill_proc_tree(self._loop_proc)
+            self._append("--- 已请求停止补采循环（含子进程树）---")
+            self._set_status("补采循环已停止")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("停止失败", str(e))
+
     # ----- 广告 -----
     def run_ads_list(self) -> None:
         self._run("广告·预览店铺", _ps_file(SCRIPTS / "run-multi-store.ps1", "-ListOnly"))
-
-    def run_ads_dry(self) -> None:
-        self._run(
-            "广告·干跑",
-            _ps_file(SCRIPTS / "run-multi-store.ps1", "-DryRun", "true"),
-            confirm="将串行打开紫鸟抓广告（不写飞书）。\n确认紫鸟已登录？",
-        )
 
     def run_ads_daily(self) -> None:
         self._run(
@@ -520,9 +599,22 @@ class App(Tk):
     # ----- 整站立即跑 -----
     def run_shop(self) -> None:
         self._run(
-            "整站·店模块",
+            "整站·立即跑全5段",
             _ps_file(SCRIPTS / "run-shop-modules-daily.ps1"),
-            confirm="立即跑店 KPI/健康/财务 → 清泉 Ingest。\n需紫鸟。继续？",
+            confirm="立即跑早上整站全5段串行：店KPI/健康/财务→订单→商品→内容→联盟 → 清泉 Ingest。\n需紫鸟。继续？",
+        )
+
+    def run_shop_daytime(self) -> None:
+        self._run_loop(
+            "事件型补采(一直跑)",
+            _ps_file(SCRIPTS / "run-shop-modules-daytime-loop.ps1", "-IntervalSec", "1800"),
+            confirm=(
+                "启动事件型补采循环：每 30 分钟跑一轮违规/差评/达人健康 → Ingest。\n"
+                "全天常驻，避开 08:00~11:30 (早上整站08:10串行5段) + 17:00~21:30 (广告17:20+夜间堆叠)，不抢紫鸟。\n"
+                "不碰销量/订单/GMV/广告(白天中间值会和全天累计值冲突)。\n"
+                "采到新违规/差评会立即 IM 私信两负责人。需紫鸟。\n"
+                "在后台常驻，不影响点其它短任务；点「停止补采循环」可单独停。继续？"
+            ),
         )
 
     def run_orders(self) -> None:
@@ -553,106 +645,33 @@ class App(Tk):
             confirm="立即跑联盟达人（强制入库，含 Pop）。\n投流/寄样不填 0。需紫鸟。继续？",
         )
 
-    def run_full_site(self) -> None:
-        self._run(
-            "整站·full-site",
-            _ps_file(SCRIPTS / "run-full-site-daily.ps1"),
-            confirm=(
-                "合并链：shop → orders → products（不含广告）。\n"
-                "勿与拆分日更同时高峰双开。需紫鸟。继续？"
-            ),
-        )
-
-    def run_post_collect(self) -> None:
-        script = REPO_SCRIPTS / "tk-p0-post-collect.ps1"
-        self._run(
-            "规则+飞书",
-            _ps_file(script, "-LookbackDays", "14"),
-            confirm=(
-                f"跑规则（ads/product/shop/content/affiliate）+ 飞书 T1/T2/T6/T7/异常。\n"
-                f"不需要紫鸟；需本机可连 PG 与飞书。\n"
-                f"定时默认 {T_POST}。继续？"
-            ),
-            cwd=REPO_ROOT,
-        )
-
-    def run_feishu_sync(self) -> None:
-        script = REPO_SCRIPTS / "feishu-tk-daily-sync.ps1"
-        self._run(
-            "飞书全量同步",
-            _ps_file(script, "-LookbackDays", "14"),
-            confirm="仅 PG→飞书同步（不含规则扫单）。需 FEISHU_* 与库连接。继续？",
-            cwd=REPO_ROOT,
-        )
-
     def run_day_loop(self) -> None:
-        self._run(
-            "白天空闲轮巡",
-            _ps_file(
-                SCRIPTS / "night-loop.ps1",
-                "-SkipAds",
-                "-IntervalSec",
-                "1800",
-            ),
-            confirm=(
-                "启动空闲轮巡：SkipAds，默认 30 分钟一轮（orders/products/shop）。\n"
-                "会一直跑直到你点「停止」或关窗口。\n"
-                f"请勿在 {T_AD} 前后与广告抢紫鸟；建议 09:00–16:50 使用。\n继续？"
-            ),
-        )
+        # 2026-08-20 移除：白天空闲轮巡(SkipAds) 会白天反复采订单/商品/店KPI等全天累计指标，
+        # 与"白天采累计值会和全天累计值冲突"的风险冲突。改用「事件型补采(循环)」
+        # (run_shop_daytime) 只采违规/差评/达人健康事件型模块。此方法保留空壳避免历史引用报错。
+        raise RuntimeError("白天空闲轮巡已停用，请改用「事件型补采(循环)」")
 
     # ----- 安装任务 -----
     def install_night_split(self) -> None:
+        # 2026-08-21：原夜间拆分5任务已废弃合并为一个 08:10 串行5段任务。
+        # 只装 install-shop-modules-daily-task.ps1（wrapper 内部串行 shop→orders→products→content→affiliate）。
+        # 其余 install-*-daily-task.ps1 已标废弃，不再调用。
         steps = [
             (
-                f"shop {T_SHOP}",
-                _ps_file(SCRIPTS / "install-shop-modules-daily-task.ps1", "-Time", T_SHOP),
-                ROOT,
-            ),
-            (
-                f"orders {T_ORDERS}",
-                _ps_file(SCRIPTS / "install-orders-daily-task.ps1", "-Time", T_ORDERS),
-                ROOT,
-            ),
-            (
-                f"products {T_PRODUCTS}",
-                _ps_file(SCRIPTS / "install-products-daily-task.ps1", "-Time", T_PRODUCTS),
-                ROOT,
-            ),
-            (
-                f"content {T_CONTENT}",
-                _ps_file(SCRIPTS / "install-content-daily-task.ps1", "-Time", T_CONTENT),
-                ROOT,
-            ),
-            (
-                f"affiliate {T_AFFILIATE}",
-                _ps_file(SCRIPTS / "install-affiliate-daily-task.ps1", "-Time", T_AFFILIATE),
+                f"整站串行5段 {T_DAILY}",
+                _ps_file(SCRIPTS / "install-shop-modules-daily-task.ps1", "-Time", T_DAILY),
                 ROOT,
             ),
         ]
         self._run_chain(
-            "安装夜间拆分任务包",
+            f"安装早上整站 {T_DAILY}(串行5段)",
             steps,
             confirm=(
-                "将安装/更新计划任务：\n"
-                f"  Shop {T_SHOP} · Orders {T_ORDERS} · Products {T_PRODUCTS}\n"
-                f"  Content {T_CONTENT} · Affiliate {T_AFFILIATE}\n\n"
-                f"不含广告 {T_AD}（请单独装）。\n"
-                f"不含 {T_POST} 规则飞书（中心机另装）。\n"
-                "勿与 TK-Full-Site-Daily 同时开。\n继续？"
+                "将安装/更新计划任务 TK-Shop-Modules-Daily：\n"
+                f"  早上 {T_DAILY} 起串行5段 → shop→orders→products→content→affiliate\n\n"
+                f"不含广告 {T_AD}（请单独装，下午跑需全天数据）。\n"
+                "继续？"
             ),
-        )
-
-    def install_post_task(self) -> None:
-        script = REPO_SCRIPTS / "install-tk-p0-post-collect-daily-task.ps1"
-        self._run(
-            f"安装 {T_POST} 尾巴",
-            _ps_file(script, "-Time", T_POST),
-            confirm=(
-                f"安装 TK-P0-Post-Collect-Daily（每天 {T_POST}）。\n"
-                "机器需能连 PostgreSQL + 飞书，不需要紫鸟。\n继续？"
-            ),
-            cwd=REPO_ROOT,
         )
 
     def install_deps(self) -> None:
@@ -730,12 +749,18 @@ class App(Tk):
             messagebox.showerror("停止失败", str(e))
 
     def _on_close(self) -> None:
-        if self._busy():
-            if not messagebox.askyesno("退出", "任务仍在运行，确定退出？"):
+        if self._busy() or self._loop_busy():
+            prompt = "任务仍在运行" if self._busy() else "补采循环仍在后台运行"
+            if not messagebox.askyesno("退出", f"{prompt}，确定退出并停止？"):
                 return
             try:
                 if self._proc:
                     self._kill_proc_tree(self._proc)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if self._loop_proc:
+                    self._kill_proc_tree(self._loop_proc)
             except Exception:  # noqa: BLE001
                 pass
         self.destroy()
